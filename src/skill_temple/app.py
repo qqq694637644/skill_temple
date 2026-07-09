@@ -6,8 +6,8 @@ The public surface is intentionally small:
 - searchSkillDocs: targeted follow-up retrieval.
 - readSkillContent: precise file reading by safe path.
 
-``listSkills`` and ``resolveSkill`` are exposed for setup/debugging but are not
-required in normal GPT-5.5 workflows.
+``listSkills`` and ``resolveSkill`` stay available as debug endpoints, but they
+are intentionally hidden from the default OpenAPI schema used by GPT Actions.
 """
 
 from __future__ import annotations
@@ -54,7 +54,10 @@ class SearchSkillDocsRequest(BaseModel):
         description="Optional safe relative file paths to restrict the search.",
     )
     limit: int = Field(default=5, ge=1, le=30)
-    mode: Literal["keyword", "semantic", "hybrid"] = Field(default="hybrid")
+    mode: Literal["keyword"] = Field(
+        default="keyword",
+        description="Only keyword mode is currently supported: SQLite FTS5 plus symbol boosting.",
+    )
     max_chars_per_match: int = Field(default=2000, ge=200, le=20_000)
     include_manifest: bool = True
 
@@ -80,7 +83,12 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
         ),
     )
 
-    @app.get("/health", operation_id="healthCheck", summary="Check gateway health.")
+    @app.get(
+        "/health",
+        operation_id="healthCheck",
+        summary="Check gateway health.",
+        include_in_schema=False,
+    )
     def health_check() -> dict[str, object]:
         return {"status": "ok", "skills_dir": str(runtime.skills_dir)}
 
@@ -92,6 +100,7 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
             "Use for setup or debugging. Normal GPT workflows should usually call "
             "retrieveSkillContext directly with the user's task."
         ),
+        include_in_schema=False,
     )
     def list_skills() -> dict[str, object]:
         return runtime.list_skills()
@@ -104,6 +113,7 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
             "Ranks available skills for a task. This is useful for diagnostics; "
             "retrieveSkillContext already performs resolution internally."
         ),
+        include_in_schema=False,
     )
     def resolve_skill(request: ResolveSkillRequest) -> dict[str, object]:
         return runtime.resolve(

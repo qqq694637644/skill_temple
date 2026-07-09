@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from skill_temple.app import create_app
 from skill_temple.runtime import SkillPathError, SkillRuntime, load_runtime
 
 
@@ -44,11 +45,20 @@ class RuntimeTests(unittest.TestCase):
     def test_search_returns_relevant_doc_excerpt(self) -> None:
         runtime = load_runtime()
 
-        result = runtime.search("idapython", "ctree visitor calls", limit=3)
+        result = runtime.search("idapython", "ctree_visitor_t cot_call", limit=3)
 
         self.assertTrue(result["matches"])
+        self.assertEqual(result["mode"], "keyword")
+        self.assertEqual(result["engine"], "sqlite_fts5_symbol_index")
         self.assertEqual(result["matches"][0]["path"], "docs/ida_hexrays.md")
         self.assertIn("ctree", result["matches"][0]["excerpt"].lower())
+        self.assertIn("ctree_visitor_t", result["matches"][0]["symbols"])
+
+    def test_search_rejects_non_keyword_mode(self) -> None:
+        runtime = load_runtime()
+
+        with self.assertRaisesRegex(RuntimeError, "Only keyword search mode"):
+            runtime.search("idapython", "ctree visitor", mode="hybrid")
 
     def test_read_file_by_safe_path(self) -> None:
         runtime = load_runtime()
@@ -67,6 +77,20 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(SkillPathError):
                     runtime.read("idapython", path)
+
+    def test_default_openapi_exposes_only_task_operations(self) -> None:
+        app = create_app()
+
+        operation_ids = {
+            operation["operationId"]
+            for path_item in app.openapi()["paths"].values()
+            for operation in path_item.values()
+        }
+
+        self.assertEqual(
+            operation_ids,
+            {"retrieveSkillContext", "searchSkillDocs", "readSkillContent"},
+        )
 
     def test_runtime_can_load_external_skill_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

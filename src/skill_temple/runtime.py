@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -17,7 +18,14 @@ from typing import Any
 
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_@*.-]+")
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_API_SYMBOL_RE = re.compile(
+    r"\b(?:ida_[A-Za-z0-9_]+|idautils|idaapi|idc)(?:\.[A-Za-z_][A-Za-z0-9_]*)?\b"
+    r"|\b[A-Za-z_][A-Za-z0-9_]*(?:_t|_[A-Z0-9]+)\b"
+    r"|\b[A-Za-z_][A-Za-z0-9_]*\(\)"
+)
 
 DEFAULT_MAX_CHARS = 12_000
 DEFAULT_MAX_DOCS = 6
@@ -225,6 +233,9 @@ class SkillRuntime:
         if not self.skills_dir.is_dir():
             raise NotADirectoryError(f"Skills path is not a directory: {self.skills_dir}")
         self._skills = self._load_skills()
+        self._search_db = sqlite3.connect(":memory:")
+        self._search_db.row_factory = sqlite3.Row
+        self._build_search_index()
 
     def _load_skills(self) -> dict[str, Skill]:
         skills: dict[str, Skill] = {}
@@ -397,46 +408,43 @@ class SkillRuntime:
         query: str,
         paths: list[str] | None = None,
         limit: int = 5,
-        mode: str = "hybrid",
+        mode: str = "keyword",
         max_chars_per_match: int = 2000,
         include_manifest: bool = True,
     ) -> dict[str, Any]:
-        """Search a skill's manifest and docs with a deterministic local scorer."""
+        """Search a skill with SQLite FTS5 plus exact symbol boosting.
+
+        Only ``keyword`` mode is currently implemented. ``semantic`` and ``hybrid``
+        are intentionally not exposed until embeddings are added, because skill
+        docs depend heavily on exact API, class, module, and constant names.
+        """
+
+        if mode != "keyword":
+            raise SkillRuntimeError("Only keyword search mode is currently supported")
 
         skill = self._get_skill(skill_id)
-        query_tokens = set(_tokens(query))
-        candidates = self._candidate_paths(skill, paths, include_manifest=include_manifest)
-        matches: list[dict[str, Any]] = []
+        allowed_paths: set[str] | None = None
+        if paths:
+            allowed_paths = set()
+            for rel_path in paths:
+                self._resolve_path(skill, rel_path)  # validates path safety
+                allowed_paths.add(rel_path)
 
-        for rel_path in candidates:
-            file_path = self._resolve_path(skill, rel_path)
-            if not file_path.exists() or not file_path.is_file():
-                continue
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-            score, start_line, end_line, excerpt = self._score_document(
-                text,
-                query,
-                query_tokens,
-                max_chars=max_chars_per_match,
-            )
-            if score <= 0:
-                continue
-            matches.append(
-                {
-                    "skill_id": skill.skill_id,
-                    "path": rel_path,
-                    "title": self._title_for_path(text, rel_path),
-                    "score": round(score, 4),
-                    "mode": mode,
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "excerpt": excerpt,
-                    "content_hash": _content_hash(file_path),
-                }
-            )
-
-        matches.sort(key=lambda item: item["score"], reverse=True)
-        return {"skill_id": skill.skill_id, "query": query, "matches": matches[:limit]}
+        matches = self._search_keyword(
+            skill=skill,
+            query=query,
+            allowed_paths=allowed_paths,
+            limit=limit,
+            max_chars_per_match=max_chars_per_match,
+            include_manifest=include_manifest,
+        )
+        return {
+            "skill_id": skill.skill_id,
+            "query": query,
+            "mode": "keyword",
+            "engine": "sqlite_fts5_symbol_index",
+            "matches": matches,
+        }
 
     def read(
         self,
@@ -529,39 +537,259 @@ class SkillRuntime:
 
         return _unique_preserve_order(candidates)
 
-    def _score_document(
+    def _build_search_index(self) -> None:
+        """Build an in-memory FTS5 index for all loaded skills."""
+
+        try:
+            self._search_db.execute(
+                """
+                CREATE VIRTUAL TABLE skill_docs_fts USING fts5(
+                    skill_id,
+                    path,
+                    title,
+                    heading_path,
+                    content,
+                    symbols,
+                    tags,
+                    start_line UNINDEXED,
+                    end_line UNINDEXED,
+                    doc_kind UNINDEXED,
+                    priority UNINDEXED,
+                    content_hash UNINDEXED
+                )
+                """
+            )
+        except sqlite3.OperationalError as exc:  # pragma: no cover - platform dependent
+            raise SkillRuntimeError("SQLite FTS5 support is required for keyword search") from exc
+
+        for skill in self._skills.values():
+            for chunk in self._iter_search_chunks(skill):
+                self._search_db.execute(
+                    """
+                    INSERT INTO skill_docs_fts(
+                        skill_id, path, title, heading_path, content, symbols, tags,
+                        start_line, end_line, doc_kind, priority, content_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        skill.skill_id,
+                        chunk["path"],
+                        chunk["title"],
+                        chunk["heading_path"],
+                        chunk["content"],
+                        " ".join(chunk["symbols"]),
+                        " ".join(chunk["tags"]),
+                        chunk["start_line"],
+                        chunk["end_line"],
+                        chunk["doc_kind"],
+                        chunk["priority"],
+                        chunk["content_hash"],
+                    ),
+                )
+        self._search_db.commit()
+
+    def _iter_search_chunks(self, skill: Skill) -> list[dict[str, Any]]:
+        doc_metadata = self._doc_metadata(skill)
+        chunks: list[dict[str, Any]] = []
+        for rel_path in self._candidate_paths(skill, paths=None, include_manifest=True):
+            file_path = self._resolve_path(skill, rel_path)
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            metadata = doc_metadata.get(rel_path, {})
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            chunks.extend(self._chunk_file(skill, rel_path, text, metadata))
+        return chunks
+
+    def _doc_metadata(self, skill: Skill) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        docs = skill.metadata.get("docs") or []
+        for item in docs:
+            if isinstance(item, dict) and item.get("path"):
+                result[str(item["path"])] = item
+            elif isinstance(item, str):
+                result[item] = {"path": item}
+        result.setdefault(skill.entrypoint, {"path": skill.entrypoint, "title": skill.name})
+        index_path = str(skill.metadata.get("index") or "INDEX.md")
+        result.setdefault(index_path, {"path": index_path, "title": "Index"})
+        return result
+
+    def _chunk_file(
         self,
+        skill: Skill,
+        rel_path: str,
         text: str,
-        query: str,
-        query_tokens: set[str],
-        max_chars: int,
-    ) -> tuple[float, int, int, str]:
+        metadata: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         lines = text.splitlines()
-        line_scores: list[tuple[float, int]] = []
-        query_lower = query.lower()
-        for index, line in enumerate(lines):
-            line_lower = line.lower()
-            line_tokens = set(_tokens(line))
-            overlap = query_tokens & line_tokens
-            score = float(len(overlap))
-            if query_lower and query_lower in line_lower:
-                score += 5.0
-            if line.startswith("#") and overlap:
-                score += 1.5
-            if score > 0:
-                line_scores.append((score, index))
+        heading_indices = [index for index, line in enumerate(lines) if _HEADING_RE.match(line)]
+        if not heading_indices:
+            heading_indices = [0]
 
-        if not line_scores:
-            return 0.0, 1, min(len(lines), 1), ""
+        chunks: list[dict[str, Any]] = []
+        for position, start_index in enumerate(heading_indices):
+            end_index = heading_indices[position + 1] if position + 1 < len(heading_indices) else len(lines)
+            section_lines = lines[start_index:end_index]
+            if not section_lines:
+                continue
+            content = "\n".join(section_lines).strip()
+            if not content:
+                continue
+            title = self._chunk_title(section_lines, metadata, rel_path)
+            tags = [str(tag) for tag in metadata.get("tags", [])]
+            symbols = self._extract_symbols("\n".join([rel_path, title, " ".join(tags), content]))
+            chunks.append(
+                {
+                    "path": rel_path,
+                    "title": title,
+                    "heading_path": title,
+                    "content": content,
+                    "symbols": symbols,
+                    "tags": tags,
+                    "start_line": start_index + 1,
+                    "end_line": end_index,
+                    "doc_kind": self._doc_kind(skill, rel_path),
+                    "priority": self._doc_priority(skill, rel_path, metadata),
+                    "content_hash": _content_hash(self._resolve_path(skill, rel_path)),
+                }
+            )
+        return chunks
 
-        best_score, best_index = max(line_scores, key=lambda item: item[0])
-        start = max(0, best_index - 4)
-        end = min(len(lines), best_index + 8)
-        excerpt = "\n".join(lines[start:end])
-        if len(excerpt) > max_chars:
-            excerpt = excerpt[:max_chars]
-        doc_bonus = min(3.0, len(line_scores) * 0.1)
-        return best_score + doc_bonus, start + 1, end, excerpt
+    def _chunk_title(self, lines: list[str], metadata: dict[str, Any], rel_path: str) -> str:
+        for line in lines[:5]:
+            match = _HEADING_RE.match(line)
+            if match:
+                return match.group(2).strip()
+        return str(metadata.get("title") or Path(rel_path).stem)
+
+    def _doc_kind(self, skill: Skill, rel_path: str) -> str:
+        if rel_path == skill.entrypoint:
+            return "manifest"
+        if rel_path == str(skill.metadata.get("index") or "INDEX.md"):
+            return "index"
+        if rel_path.endswith(".rst"):
+            return "full_reference"
+        return "summary_doc"
+
+    def _doc_priority(self, skill: Skill, rel_path: str, metadata: dict[str, Any]) -> float:
+        if "priority" in metadata:
+            return float(metadata["priority"])
+        kind = self._doc_kind(skill, rel_path)
+        if kind == "manifest":
+            return 50.0
+        if kind == "index":
+            return 30.0
+        if kind == "summary_doc":
+            return 20.0
+        return 5.0
+
+    def _extract_symbols(self, text: str) -> list[str]:
+        symbols: list[str] = []
+        for match in _BACKTICK_RE.findall(text):
+            symbols.extend(_API_SYMBOL_RE.findall(match))
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", match):
+                symbols.append(match)
+        symbols.extend(_API_SYMBOL_RE.findall(text))
+        normalized = []
+        for symbol in symbols:
+            clean = symbol.strip().strip("`.,:;()")
+            if len(clean) >= 3:
+                normalized.append(clean)
+                if "." in clean:
+                    normalized.extend(part for part in clean.split(".") if len(part) >= 3)
+        return _unique_preserve_order(normalized)
+
+    def _fts_query(self, query: str) -> str:
+        terms = []
+        for term in _FTS_TOKEN_RE.findall(query):
+            term = term.lower()
+            if len(term) < 2:
+                continue
+            terms.append(term)
+        terms = _unique_preserve_order(terms)[:16]
+        return " OR ".join(f'"{term}"' for term in terms)
+
+    def _search_keyword(
+        self,
+        skill: Skill,
+        query: str,
+        allowed_paths: set[str] | None,
+        limit: int,
+        max_chars_per_match: int,
+        include_manifest: bool,
+    ) -> list[dict[str, Any]]:
+        match_query = self._fts_query(query)
+        if not match_query:
+            return []
+
+        rows = self._search_db.execute(
+            """
+            SELECT rowid, skill_id, path, title, heading_path, content, symbols, tags,
+                   start_line, end_line, doc_kind, priority, content_hash,
+                   bm25(skill_docs_fts) AS bm25_rank
+            FROM skill_docs_fts
+            WHERE skill_docs_fts MATCH ? AND skill_id = ?
+            ORDER BY bm25_rank
+            LIMIT 200
+            """,
+            (match_query, skill.skill_id),
+        ).fetchall()
+
+        query_terms = set(_tokens(query))
+        query_symbols = set(self._extract_symbols(query))
+        scored: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, int, int]] = set()
+        for rank_index, row in enumerate(rows):
+            rel_path = str(row["path"])
+            if allowed_paths is not None and rel_path not in allowed_paths:
+                continue
+            if not include_manifest and row["doc_kind"] == "manifest":
+                continue
+
+            key = (rel_path, int(row["start_line"]), int(row["end_line"]))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            row_symbols = set(str(row["symbols"] or "").split())
+            row_tags = set(str(row["tags"] or "").split())
+            heading_tokens = set(_tokens(str(row["heading_path"] or "")))
+            path_tokens = set(_tokens(rel_path))
+
+            symbol_overlap = query_symbols & row_symbols
+            heading_overlap = query_terms & heading_tokens
+            path_overlap = query_terms & path_tokens
+            tag_overlap = query_terms & row_tags
+
+            # FTS bm25 values are smaller when better. Rank position is stable and
+            # easier to combine with exact symbol/path/heading boosts.
+            score = 50.0 / (rank_index + 1)
+            score += 100.0 * len(symbol_overlap)
+            score += 40.0 * len(path_overlap)
+            score += 30.0 * len(heading_overlap)
+            score += 15.0 * len(tag_overlap)
+            score += float(row["priority"] or 0.0)
+
+            content = str(row["content"] or "")
+            excerpt = content[:max_chars_per_match]
+            scored.append(
+                {
+                    "skill_id": skill.skill_id,
+                    "path": rel_path,
+                    "title": str(row["title"] or Path(rel_path).stem),
+                    "heading_path": str(row["heading_path"] or ""),
+                    "score": round(score, 4),
+                    "mode": "keyword",
+                    "engine": "sqlite_fts5_symbol_index",
+                    "start_line": int(row["start_line"]),
+                    "end_line": int(row["end_line"]),
+                    "excerpt": excerpt,
+                    "symbols": sorted(symbol_overlap),
+                    "content_hash": str(row["content_hash"]),
+                }
+            )
+
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:limit]
 
     def _title_for_path(self, text: str, path: str) -> str:
         for line in text.splitlines()[:20]:

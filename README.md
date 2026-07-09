@@ -26,15 +26,26 @@ Custom GPT Knowledge is useful as a reference source, but it is not a determinis
 
 ## API surface
 
-The GPT Action-facing API is intentionally small:
+The default GPT Action-facing OpenAPI schema is intentionally small:
 
 | Operation | Method | Path | Purpose |
 | --- | --- | --- | --- |
 | `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Default first call for tasks that may require a reusable skill. |
-| `searchSkillDocs` | `POST` | `/v1/skills/search` | Targeted follow-up search inside one skill. |
+| `searchSkillDocs` | `POST` | `/v1/skills/search` | Targeted follow-up keyword search inside one skill. |
 | `readSkillContent` | `POST` | `/v1/skills/read` | Precise safe-path file read. |
+
+Debug endpoints remain callable but are hidden from OpenAPI by default so GPT Actions do not treat them as normal task tools:
+
+| Operation | Method | Path | Purpose |
+| --- | --- | --- | --- |
 | `listSkills` | `GET` | `/v1/skills` | Setup/debugging. |
-| `resolveSkill` | `POST` | `/v1/skills/resolve` | Setup/debugging; `retrieveSkillContext` already resolves internally. |
+| `resolveSkill` | `POST` | `/v1/skills/resolve` | Routing diagnostics; `retrieveSkillContext` already resolves internally. |
+
+## Search behavior
+
+`searchSkillDocs` currently supports only `mode="keyword"`. The keyword engine uses SQLite FTS5 over section-level chunks and boosts exact symbols such as `ida_hexrays.decompile`, `ctree_visitor_t`, `idautils.XrefsTo`, constants, headings, path/module hints, tags, and document priority.
+
+`semantic` and `hybrid` modes are intentionally not exposed until embedding support is added. Skill documentation depends heavily on exact API names, so keyword + symbol matching is the safer default.
 
 ## Skill directory layout
 
@@ -123,7 +134,7 @@ Search docs:
 Invoke-RestMethod http://127.0.0.1:8765/v1/skills/search `
   -Method Post `
   -ContentType 'application/json' `
-  -Body '{"skill_id":"idapython","query":"ctree visitor calls"}'
+  -Body '{"skill_id":"idapython","query":"ctree visitor calls","mode":"keyword"}'
 ```
 
 Read a specific skill file:
