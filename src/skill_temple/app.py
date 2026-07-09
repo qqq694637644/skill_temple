@@ -43,13 +43,7 @@ class RetrieveSkillContextRequest(BaseModel):
             "when user writes @idapython."
         ),
     )
-    max_skills: int = Field(default=1, ge=1, le=5)
     max_docs: int = Field(default=6, ge=1, le=20)
-    max_chars: int = Field(default=12_000, ge=1000, le=80_000)
-    detail_level: Literal["brief", "balanced", "deep"] = Field(default="balanced")
-    include_manifest: bool = True
-    include_policy: bool = True
-    include_recommended_tools: bool = True
     allow_skill_chaining: bool = Field(
         default=False,
         description="Allow multiple cooperating skills in one retrieval result.",
@@ -171,13 +165,8 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
             return runtime.retrieve(
                 query=request.query,
                 hinted_skill_ids=request.hinted_skill_ids,
-                max_skills=request.max_skills,
+                max_skills=3 if request.allow_skill_chaining else 1,
                 max_docs=request.max_docs,
-                max_chars=request.max_chars,
-                detail_level=request.detail_level,
-                include_manifest=request.include_manifest,
-                include_policy=request.include_policy,
-                include_recommended_tools=request.include_recommended_tools,
                 allow_skill_chaining=request.allow_skill_chaining,
                 include_debug=request.include_debug,
             )

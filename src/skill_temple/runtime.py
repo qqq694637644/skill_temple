@@ -1037,17 +1037,30 @@ class SkillRuntime:
             module = row.get("Module") or row.get("module")
             if module:
                 preferred.append(str(module))
-        must_include = self._operating_rules(manifest_summary, skill)[:4]
+        contract = dict(skill.metadata.get("response_contract") or {})
+        must_include = [str(item) for item in contract.get("must_include", [])]
+        if not must_include:
+            must_include = self._default_must_include(skill)
         return {
-            "expected_output": skill.metadata.get(
+            "expected_output": contract.get("expected_output")
+            or skill.metadata.get(
                 "expected_output",
                 "Answer the user task using the selected skill instructions and evidence.",
             ),
             "must_include": must_include,
             "preferred_modules_or_topics": preferred[:8],
-            "evidence_paths": [doc["path"] for doc in docs],
-            "must_avoid": [str(item) for item in skill.policy.get("must_avoid", [])],
+            "must_avoid": [
+                str(item)
+                for item in contract.get("must_avoid", skill.policy.get("must_avoid", []))
+            ],
         }
+
+    def _default_must_include(self, skill: Skill) -> list[str]:
+        return [
+            "Directly satisfy the user's requested output format.",
+            "Name the relevant APIs, files, or tools used from the evidence.",
+            "Include validation or dry-run guidance when the task can change external state.",
+        ]
 
     def _answer_readiness(
         self,

@@ -45,6 +45,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(selected["operating_rules"])
         self.assertTrue(selected["evidence"])
         self.assertTrue(selected["response_contract"]["expected_output"])
+        self.assertIn("Mention required imports", selected["response_contract"]["must_include"][1])
+        self.assertNotEqual(
+            selected["operating_rules"][:3],
+            selected["response_contract"]["must_include"][:3],
+        )
+        self.assertNotIn("evidence_paths", selected["response_contract"])
         self.assertTrue(selected["validation_guidance"])
         self.assertNotIn("manifest_summary", selected)
         self.assertNotIn("retrieved_docs", selected)
@@ -126,6 +132,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(
             operation_ids,
             {"retrieveSkillContext", "searchSkillDocs", "readSkillContent"},
+        )
+        retrieve_schema = app.openapi()["components"]["schemas"]["RetrieveSkillContextRequest"]
+        retrieve_fields = set(retrieve_schema["properties"])
+        self.assertEqual(
+            retrieve_fields,
+            {"query", "hinted_skill_ids", "max_docs", "allow_skill_chaining", "include_debug"},
         )
 
     def test_http_endpoints_work_through_testclient(self) -> None:

@@ -15,6 +15,17 @@
   "conflicts_with": ["ghidra", "binary_ninja"],
   "can_chain_with": ["malware_analysis", "yara"],
   "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
+  "response_contract": {
+    "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
+    "must_include": [
+      "Provide IDAPython code when the user asks for code.",
+      "Mention required imports used by the script.",
+      "Mention validation or dry-run steps when the task can mutate an IDB."
+    ],
+    "must_avoid": [
+      "Do not present mutating database changes as already applied."
+    ]
+  },
   "aliases": ["@idapython", "idapython", "IDA", "IDAPython", "Hex-Rays"],
   "entrypoint": "SKILL.md",
   "index": "INDEX.md",

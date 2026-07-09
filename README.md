@@ -91,8 +91,7 @@ debug report. Key fields:
       ],
       "response_contract": {
         "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
-        "must_include": ["Call ida_auto.auto_wait() before reading analysis results."],
-        "evidence_paths": ["docs/ida_hexrays.md"]
+        "must_include": ["Mention required imports used by the script."]
       },
       "validation_guidance": {
         "suggested_checks": ["Confirm the script is read-only unless mutation is requested."]
@@ -119,6 +118,21 @@ mode adds diagnostic fields such as `manifest_summary`, raw `retrieved_docs`,
 `rank_features` inside evidence, `composition_plan`, `used_chars`, and
 `fallback_queries` even when the decision is ready. Without debug mode,
 `fallback_queries` is returned only when `decision.ready=false`.
+
+The GPT Action request schema for `retrieveSkillContext` is intentionally small:
+
+```json
+{
+  "query": "@idapython write a script to find xrefs to strcpy",
+  "hinted_skill_ids": ["idapython"],
+  "max_docs": 6,
+  "allow_skill_chaining": false,
+  "include_debug": false
+}
+```
+
+Other retrieval tuning knobs remain runtime-level API parameters, but are not
+exposed in the default GPT Action request model.
 
 By default, retrieval returns one primary skill. Set `allow_skill_chaining=true`
 and increase `max_skills` to return secondary supporting skills. Chaining is
@@ -161,6 +175,13 @@ Minimal `skill.json`:
   "conflicts_with": ["ghidra", "binary_ninja"],
   "can_chain_with": ["malware_analysis", "yara"],
   "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
+  "response_contract": {
+    "must_include": [
+      "Provide IDAPython code when the user asks for code.",
+      "Mention required imports used by the script.",
+      "Mention validation or dry-run steps when the task can mutate an IDB."
+    ]
+  },
   "aliases": ["@idapython", "idapython", "IDA", "Hex-Rays"],
   "entrypoint": "SKILL.md",
   "index": "INDEX.md",
