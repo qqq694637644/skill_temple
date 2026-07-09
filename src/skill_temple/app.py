@@ -50,6 +50,10 @@ class RetrieveSkillContextRequest(BaseModel):
     include_manifest: bool = True
     include_policy: bool = True
     include_recommended_tools: bool = True
+    allow_skill_chaining: bool = Field(
+        default=False,
+        description="Allow multiple cooperating skills in one retrieval result.",
+    )
 
 
 class SearchSkillDocsRequest(BaseModel):
@@ -91,6 +95,19 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
             "Custom GPT Knowledge to unpack or index skill archives."
         ),
     )
+
+    def structured_error(
+        code: str,
+        message: str,
+        suggested_next_action: str,
+    ) -> dict[str, object]:
+        return {
+            "error": {
+                "code": code,
+                "message": message,
+                "suggested_next_action": suggested_next_action,
+            }
+        }
 
     @app.get(
         "/health",
@@ -156,6 +173,7 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
             include_manifest=request.include_manifest,
             include_policy=request.include_policy,
             include_recommended_tools=request.include_recommended_tools,
+            allow_skill_chaining=request.allow_skill_chaining,
         )
 
     @app.post(
@@ -178,8 +196,12 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
                 max_chars_per_match=request.max_chars_per_match,
                 include_manifest=request.include_manifest,
             )
-        except (SkillNotFoundError, SkillPathError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SkillNotFoundError as exc:
+            detail = structured_error("skill_not_found", str(exc), "check_skill_id")
+            raise HTTPException(status_code=404, detail=detail) from exc
+        except SkillPathError as exc:
+            detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
+            raise HTTPException(status_code=404, detail=detail) from exc
 
     @app.post(
         "/v1/skills/read",
@@ -199,8 +221,12 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
                 max_lines=request.max_lines,
                 max_chars=request.max_chars,
             )
-        except (SkillNotFoundError, SkillPathError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SkillNotFoundError as exc:
+            detail = structured_error("skill_not_found", str(exc), "check_skill_id")
+            raise HTTPException(status_code=404, detail=detail) from exc
+        except SkillPathError as exc:
+            detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
+            raise HTTPException(status_code=404, detail=detail) from exc
 
     return app
 

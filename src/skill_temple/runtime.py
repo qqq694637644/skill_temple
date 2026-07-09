@@ -87,6 +87,26 @@ class Skill:
     def retrieval(self) -> dict[str, Any]:
         return dict(self.metadata.get("retrieval") or {})
 
+    @property
+    def skill_type(self) -> str:
+        return str(self.metadata.get("skill_type") or "tool_doc")
+
+    @property
+    def capability_tags(self) -> list[str]:
+        return [str(item) for item in self.metadata.get("capability_tags", [])]
+
+    @property
+    def domains(self) -> list[str]:
+        return [str(item) for item in self.metadata.get("domains", [])]
+
+    @property
+    def conflicts_with(self) -> list[str]:
+        return [str(item) for item in self.metadata.get("conflicts_with", [])]
+
+    @property
+    def can_chain_with(self) -> list[str]:
+        return [str(item) for item in self.metadata.get("can_chain_with", [])]
+
 
 def load_runtime(skills_dir: str | Path | None = None) -> SkillRuntime:
     """Create a runtime from an explicit path, environment, cwd, or packaged examples."""
@@ -345,15 +365,23 @@ class SkillRuntime:
         include_manifest: bool = True,
         include_policy: bool = True,
         include_recommended_tools: bool = True,
+        allow_skill_chaining: bool = False,
     ) -> dict[str, Any]:
         """Retrieve sufficient skill context for a user task in one call."""
 
-        resolved = self.resolve(query, hinted_skill_ids=hinted_skill_ids, max_results=max_skills)
+        effective_max_skills = max_skills if allow_skill_chaining else 1
+        resolved = self.resolve(
+            query,
+            hinted_skill_ids=hinted_skill_ids,
+            max_results=effective_max_skills,
+        )
         selected: list[dict[str, Any]] = []
         budget_remaining = max_chars
+        used_chars = 0
+        used_docs = 0
         truncated = False
 
-        for match in resolved["matches"][:max_skills]:
+        for index, match in enumerate(resolved["matches"][:effective_max_skills]):
             skill = self._get_skill(match["skill_id"])
             manifest_text = self._read_skill_file(skill, skill.entrypoint, max_chars=6000)
             manifest_summary = self._manifest_summary(manifest_text) if include_manifest else {}
@@ -373,43 +401,77 @@ class SkillRuntime:
                     truncated = True
                     break
                 budget_remaining -= content_len
+                used_chars += content_len
+                used_docs += 1
                 docs.append(doc)
 
+            role = "primary" if index == 0 else "secondary"
+            operating_rules = self._operating_rules(manifest_summary, skill)
+            response_contract = self._response_contract(skill, manifest_summary, docs)
+            answer_readiness = self._answer_readiness(skill, docs, truncated)
+            evidence = self._evidence(docs)
             selected.append(
                 {
                     "skill_id": skill.skill_id,
                     "name": skill.name,
                     "version": skill.version,
+                    "skill_type": skill.skill_type,
+                    "capability_tags": skill.capability_tags,
+                    "domains": skill.domains,
+                    "role": role,
                     "confidence": match["confidence"],
                     "why_selected": match["reason"],
+                    "activation": {
+                        "confidence": match["confidence"],
+                        "reason": match["reason"],
+                        "hinted": skill.skill_id in (hinted_skill_ids or []),
+                    },
                     "manifest_hash": self._hash_if_exists(skill, skill.entrypoint),
                     "manifest_summary": manifest_summary,
+                    "operating_rules": operating_rules,
                     "retrieved_docs": docs,
+                    "evidence": evidence,
                     "tool_policy": skill.policy if include_policy else {},
                     "recommended_tools": (
                         self._recommended_tools(skill) if include_recommended_tools else []
                     ),
+                    "response_contract": response_contract,
+                    "answer_readiness": answer_readiness,
                     "execution_guidance": self._execution_guidance(skill, manifest_summary, docs),
                     "validation_guidance": self._validation_guidance(skill),
                 }
             )
 
-        need_more_context = truncated or not selected
+        ready = bool(selected) and not truncated and all(
+            skill_packet["answer_readiness"]["ready"] for skill_packet in selected
+        )
+        need_more_context = not ready
+        stop_condition = {
+            "satisfied": ready,
+            "reason": self._stop_reason(selected, truncated),
+        }
         return {
             "selected_skills": selected,
+            "composition_plan": self._composition_plan(selected, allow_skill_chaining),
             "retrieval_budget": {
                 "max_skills": max_skills,
+                "effective_max_skills": effective_max_skills,
                 "max_docs": max_docs,
                 "max_chars": max_chars,
+                "used_docs": used_docs,
+                "used_chars": used_chars,
                 "truncated": truncated,
+            },
+            "stop_condition": stop_condition,
+            "answer_readiness": {
+                "ready": ready,
+                "reason": stop_condition["reason"],
+                "recommended_next_action": "answer" if ready else "searchSkillDocs",
             },
             "need_more_context": need_more_context,
             "recommended_next_action": "searchSkillDocs" if need_more_context else "answer",
-            "reason": (
-                "Context budget was exhausted."
-                if truncated
-                else "Retrieved sufficient context."
-            ),
+            "fallback_queries": self._fallback_queries(query, selected),
+            "reason": stop_condition["reason"],
         }
 
     def search(
@@ -772,6 +834,8 @@ class SkillRuntime:
             row_tags = set(str(row["tags"] or "").split())
             heading_tokens = set(_tokens(str(row["heading_path"] or "")))
             path_tokens = set(_tokens(rel_path))
+            row_priority = float(row["priority"] or 0.0)
+            bm25_rank = float(row["bm25_rank"] or 0.0)
 
             symbol_overlap = query_symbols & row_symbols
             heading_overlap = query_terms & heading_tokens
@@ -780,12 +844,27 @@ class SkillRuntime:
 
             # FTS bm25 values are smaller when better. Rank position is stable and
             # easier to combine with exact symbol/path/heading boosts.
-            score = 50.0 / (rank_index + 1)
-            score += 100.0 * len(symbol_overlap)
-            score += 40.0 * len(path_overlap)
-            score += 30.0 * len(heading_overlap)
-            score += 15.0 * len(tag_overlap)
-            score += float(row["priority"] or 0.0)
+            fts_rank_score = 50.0 / (rank_index + 1)
+            symbol_score = 100.0 * len(symbol_overlap)
+            path_score = 40.0 * len(path_overlap)
+            heading_score = 30.0 * len(heading_overlap)
+            tag_score = 15.0 * len(tag_overlap)
+            score = fts_rank_score + symbol_score + path_score + heading_score
+            score += tag_score + row_priority
+            rank_features = {
+                "symbol_matches": sorted(symbol_overlap),
+                "document_symbols": sorted(row_symbols)[:25],
+                "path_matches": sorted(path_overlap),
+                "heading_matches": sorted(heading_overlap),
+                "tag_matches": sorted(tag_overlap),
+                "fts_rank": bm25_rank,
+                "fts_rank_score": round(fts_rank_score, 4),
+                "symbol_score": round(symbol_score, 4),
+                "path_score": round(path_score, 4),
+                "heading_score": round(heading_score, 4),
+                "tag_score": round(tag_score, 4),
+                "doc_priority": row_priority,
+            }
 
             content = str(row["content"] or "")
             excerpt = content[:max_chars_per_match]
@@ -802,6 +881,9 @@ class SkillRuntime:
                     "end_line": int(row["end_line"]),
                     "excerpt": excerpt,
                     "symbols": sorted(symbol_overlap),
+                    "document_symbols": sorted(row_symbols)[:25],
+                    "rank_features": rank_features,
+                    "why_relevant": self._why_relevant(rank_features),
                     "content_hash": str(row["content_hash"]),
                 }
             )
@@ -824,6 +906,11 @@ class SkillRuntime:
             "description": skill.description,
             "aliases": skill.aliases,
             "trigger_terms": skill.trigger_terms,
+            "skill_type": skill.skill_type,
+            "capability_tags": skill.capability_tags,
+            "domains": skill.domains,
+            "conflicts_with": skill.conflicts_with,
+            "can_chain_with": skill.can_chain_with,
             "manifest_hash": self._hash_if_exists(skill, skill.entrypoint),
         }
 
@@ -872,6 +959,130 @@ class SkillRuntime:
             "retrieved_doc_paths": [doc["path"] for doc in docs],
             "policy": skill.policy,
         }
+
+    def _operating_rules(self, manifest_summary: dict[str, Any], skill: Skill) -> list[str]:
+        rules = [str(rule) for rule in manifest_summary.get("critical_rules", [])]
+        if not rules and skill.policy:
+            rules.extend(str(item) for item in skill.policy.get("suggested_checks", []))
+        return rules[:8]
+
+    def _response_contract(
+        self,
+        skill: Skill,
+        manifest_summary: dict[str, Any],
+        docs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        preferred = []
+        for row in manifest_summary.get("module_router", []):
+            module = row.get("Module") or row.get("module")
+            if module:
+                preferred.append(str(module))
+        must_include = self._operating_rules(manifest_summary, skill)[:4]
+        return {
+            "expected_output": skill.metadata.get(
+                "expected_output",
+                "Answer the user task using the selected skill instructions and evidence.",
+            ),
+            "must_include": must_include,
+            "preferred_modules_or_topics": preferred[:8],
+            "evidence_paths": [doc["path"] for doc in docs],
+            "must_avoid": [str(item) for item in skill.policy.get("must_avoid", [])],
+        }
+
+    def _answer_readiness(
+        self,
+        skill: Skill,
+        docs: list[dict[str, Any]],
+        truncated: bool,
+    ) -> dict[str, Any]:
+        if truncated:
+            return {
+                "ready": False,
+                "reason": "The retrieval budget was exhausted before all matches were included.",
+                "recommended_next_action": "searchSkillDocs",
+            }
+        if docs:
+            return {
+                "ready": True,
+                "reason": "Manifest rules and relevant documentation snippets are available.",
+                "recommended_next_action": "answer",
+            }
+        return {
+            "ready": False,
+            "reason": f"No relevant documentation snippets were retrieved for {skill.skill_id}.",
+            "recommended_next_action": "searchSkillDocs",
+        }
+
+    def _evidence(self, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        evidence: list[dict[str, Any]] = []
+        for doc in docs:
+            evidence.append(
+                {
+                    "path": doc["path"],
+                    "section": doc.get("heading_path") or doc.get("title"),
+                    "score": doc.get("score"),
+                    "why_relevant": doc.get("why_relevant", "Matched by keyword search."),
+                    "rank_features": doc.get("rank_features", {}),
+                }
+            )
+        return evidence
+
+    def _stop_reason(self, selected: list[dict[str, Any]], truncated: bool) -> str:
+        if truncated:
+            return "Context budget was exhausted."
+        if not selected:
+            return "No skill matched the task."
+        not_ready = [item["skill_id"] for item in selected if not item["answer_readiness"]["ready"]]
+        if not_ready:
+            return f"More context is needed for: {', '.join(not_ready)}."
+        return "Selected skill context is sufficient to answer."
+
+    def _fallback_queries(self, query: str, selected: list[dict[str, Any]]) -> list[str]:
+        fallback = [query]
+        for packet in selected:
+            tags = packet.get("capability_tags", [])[:4]
+            paths = [doc["path"] for doc in packet.get("retrieved_docs", [])[:2]]
+            if tags:
+                fallback.append(" ".join([packet["skill_id"], *tags]))
+            if paths:
+                fallback.append(" ".join([packet["skill_id"], *paths]))
+        return _unique_preserve_order(fallback)[:5]
+
+    def _composition_plan(
+        self,
+        selected: list[dict[str, Any]],
+        allow_skill_chaining: bool,
+    ) -> dict[str, Any]:
+        if not selected:
+            return {
+                "enabled": allow_skill_chaining,
+                "strategy": "No skill selected.",
+                "skills": [],
+            }
+        if len(selected) == 1:
+            return {
+                "enabled": allow_skill_chaining,
+                "strategy": "Use the selected primary skill only.",
+                "skills": [{"skill_id": selected[0]["skill_id"], "role": "primary"}],
+            }
+        return {
+            "enabled": allow_skill_chaining,
+            "strategy": "Use the primary skill first, then secondary skills as supporting context.",
+            "skills": [
+                {"skill_id": item["skill_id"], "role": item["role"]} for item in selected
+            ],
+        }
+
+    def _why_relevant(self, rank_features: dict[str, Any]) -> str:
+        if rank_features.get("symbol_matches"):
+            return "Matched exact API or symbol names."
+        if rank_features.get("path_matches"):
+            return "Matched path or module terms."
+        if rank_features.get("heading_matches"):
+            return "Matched section heading terms."
+        if rank_features.get("tag_matches"):
+            return "Matched document tags."
+        return "Matched full-text keyword search."
 
     def _validation_guidance(self, skill: Skill) -> dict[str, Any]:
         policy = skill.policy

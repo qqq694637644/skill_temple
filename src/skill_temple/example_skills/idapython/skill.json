@@ -3,6 +3,18 @@
   "name": "idapython",
   "version": "example-0.1.0",
   "description": "IDA Pro Python scripting for reverse engineering, decompilation, xrefs, functions, names, bytes, and ida_* APIs.",
+  "skill_type": "tool_doc",
+  "capability_tags": [
+    "reverse_engineering",
+    "python_scripting",
+    "ida_pro",
+    "decompiler",
+    "xrefs"
+  ],
+  "domains": ["binary_analysis"],
+  "conflicts_with": ["ghidra", "binary_ninja"],
+  "can_chain_with": ["malware_analysis", "yara"],
+  "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
   "aliases": ["@idapython", "idapython", "IDA", "IDAPython", "Hex-Rays"],
   "entrypoint": "SKILL.md",
   "index": "INDEX.md",

@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
+from skill_temple.evals import evaluate_file
 from skill_temple.runtime import SkillPathError, SkillRuntime, load_runtime
 
 
@@ -42,6 +43,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(selected["manifest_summary"]["critical_rules"])
         self.assertTrue(selected["manifest_summary"]["module_router"])
         self.assertTrue(selected["retrieved_docs"])
+        self.assertEqual(selected["skill_type"], "tool_doc")
+        self.assertIn("reverse_engineering", selected["capability_tags"])
+        self.assertEqual(selected["role"], "primary")
+        self.assertTrue(selected["answer_readiness"]["ready"])
+        self.assertTrue(selected["operating_rules"])
+        self.assertTrue(selected["evidence"])
+        self.assertTrue(selected["response_contract"]["expected_output"])
+        self.assertTrue(result["answer_readiness"]["ready"])
+        self.assertTrue(result["stop_condition"]["satisfied"])
+        self.assertGreaterEqual(result["retrieval_budget"]["used_docs"], 1)
         self.assertEqual(result["recommended_next_action"], "answer")
 
     def test_search_returns_relevant_doc_excerpt(self) -> None:
@@ -55,6 +66,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["matches"][0]["path"], "docs/ida_hexrays.md")
         self.assertIn("ctree", result["matches"][0]["excerpt"].lower())
         self.assertIn("ctree_visitor_t", result["matches"][0]["symbols"])
+        self.assertIn("rank_features", result["matches"][0])
+        self.assertIn("why_relevant", result["matches"][0])
 
     def test_search_rejects_non_keyword_mode(self) -> None:
         runtime = load_runtime()
@@ -127,6 +140,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(retrieve_response.status_code, 200)
         retrieve_body = retrieve_response.json()
         self.assertEqual(retrieve_body["selected_skills"][0]["skill_id"], "idapython")
+        self.assertTrue(retrieve_body["answer_readiness"]["ready"])
+
+    def test_http_expected_errors_are_structured(self) -> None:
+        client = TestClient(create_app())
+
+        response = client.post(
+            "/v1/skills/read",
+            json={"skill_id": "missing", "path": "SKILL.md"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"]["error"]["code"], "skill_not_found")
+
+    def test_eval_file_passes_packaged_skill_queries(self) -> None:
+        report = evaluate_file(Path("evals/skill_queries.jsonl"))
+
+        self.assertEqual(report["failed"], 0)
+        self.assertGreaterEqual(report["passed"], 2)
 
     def test_runtime_can_load_external_skill_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -166,6 +197,49 @@ class RuntimeTests(unittest.TestCase):
                 result["selected_skills"][0]["retrieved_docs"][0]["path"],
                 "docs/demo.md",
             )
+
+    def test_runtime_can_return_multiple_skills_when_chaining_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            skills_root = tmp_path / "skills"
+            for skill_id, trigger in [("alpha", "shared-task"), ("beta", "shared-task")]:
+                skill_root = skills_root / skill_id
+                docs_root = skill_root / "docs"
+                docs_root.mkdir(parents=True)
+                (skill_root / "skill.json").write_text(
+                    json.dumps(
+                        {
+                            "skill_id": skill_id,
+                            "name": skill_id,
+                            "version": "1",
+                            "description": f"{skill_id} skill for shared task.",
+                            "aliases": [f"@{skill_id}"],
+                            "activation": {"trigger_terms": [trigger]},
+                            "entrypoint": "SKILL.md",
+                            "docs": [{"path": "docs/shared.md", "title": "shared"}],
+                            "capability_tags": [skill_id, "shared"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (skill_root / "SKILL.md").write_text(
+                    f"# {skill_id}\n\n## Critical Rules\n\n1. Use {skill_id}.\n",
+                    encoding="utf-8",
+                )
+                (docs_root / "shared.md").write_text(
+                    f"# Shared\n\n{trigger} content for {skill_id}.\n",
+                    encoding="utf-8",
+                )
+
+            runtime = SkillRuntime(skills_root)
+            single = runtime.retrieve("shared-task")
+            chained = runtime.retrieve("shared-task", max_skills=2, allow_skill_chaining=True)
+
+            self.assertEqual(len(single["selected_skills"]), 1)
+            self.assertEqual(len(chained["selected_skills"]), 2)
+            self.assertEqual(chained["selected_skills"][0]["role"], "primary")
+            self.assertEqual(chained["selected_skills"][1]["role"], "secondary")
+            self.assertTrue(chained["composition_plan"]["enabled"])
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 skill-temple = "skill_temple.app:main"
+skill-temple-eval = "skill_temple.evals:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
