@@ -403,7 +403,6 @@ class SkillRuntime:
         max_skills: int = DEFAULT_MAX_SKILLS,
         max_docs: int = DEFAULT_MAX_DOCS,
         max_chars: int = DEFAULT_MAX_CHARS,
-        detail_level: str = "balanced",
         include_manifest: bool = True,
         include_policy: bool = True,
         include_recommended_tools: bool = True,

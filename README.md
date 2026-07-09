@@ -114,11 +114,12 @@ debug report. Key fields:
 ```
 
 The GPT Action schema does not expose `include_debug`. Use the hidden web console
-at `/console` for development, evals, or retrieval tuning. The console can ask
-for debug mode, which adds diagnostic fields such as `manifest_summary`, raw
-`retrieved_docs`, `rank_features` inside evidence, `composition_plan`,
-`used_chars`, and `fallback_queries` even when the decision is ready. Without
-debug mode, `fallback_queries` is returned only when `decision.ready=false`.
+at `/console` only from localhost or a private trusted network for development,
+evals, or retrieval tuning. The console can ask for debug mode, which adds
+diagnostic fields such as `manifest_summary`, raw `retrieved_docs`,
+`rank_features` inside evidence, `composition_plan`, `used_chars`, and
+`fallback_queries` even when the decision is ready. Without debug mode,
+`fallback_queries` is returned only when `decision.ready=false`.
 
 The GPT Action request schema for `retrieveSkillContext` is intentionally small:
 
@@ -233,6 +234,8 @@ http://127.0.0.1:8765/console
 ```
 
 It is not included in the GPT Action OpenAPI schema and can request debug output.
+Use it only on localhost or behind private access controls; do not expose it as a
+public internet endpoint.
 
 For a public Custom GPT Action, the endpoint must be reachable by OpenAI over HTTPS. A local `127.0.0.1` server is useful for development but not directly reachable by the hosted GPT Action runtime.
 
