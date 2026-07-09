@@ -408,6 +408,7 @@ class SkillRuntime:
         include_policy: bool = True,
         include_recommended_tools: bool = True,
         allow_skill_chaining: bool = False,
+        include_debug: bool = False,
     ) -> dict[str, Any]:
         """Retrieve sufficient skill context for a user task in one call."""
 
@@ -424,6 +425,7 @@ class SkillRuntime:
             allow_skill_chaining=allow_skill_chaining,
         )
         selected: list[dict[str, Any]] = []
+        not_ready_skill_ids: list[str] = []
         budget_remaining = max_chars
         used_chars = 0
         used_docs = 0
@@ -457,17 +459,27 @@ class SkillRuntime:
             operating_rules = self._operating_rules(manifest_summary, skill)
             response_contract = self._response_contract(skill, manifest_summary, docs)
             answer_readiness = self._answer_readiness(skill, docs, truncated)
-            evidence = self._evidence(docs)
-            selected.append(
-                {
-                    "skill_id": skill.skill_id,
+            if not answer_readiness["ready"]:
+                not_ready_skill_ids.append(skill.skill_id)
+            evidence = self._evidence(docs, include_debug=include_debug)
+            selected_packet: dict[str, Any] = {
+                "skill_id": skill.skill_id,
+                "role": role,
+                "confidence": match["confidence"],
+                "capability_tags": skill.capability_tags[:6],
+                "operating_rules": operating_rules,
+                "response_contract": response_contract,
+                "evidence": evidence,
+                "validation_guidance": self._validation_guidance(skill),
+            }
+            if include_debug:
+                selected_packet["debug"] = {
                     "name": skill.name,
                     "version": skill.version,
                     "skill_type": skill.skill_type,
-                    "capability_tags": skill.capability_tags,
                     "domains": skill.domains,
-                    "role": role,
-                    "confidence": match["confidence"],
+                    "conflicts_with": skill.conflicts_with,
+                    "can_chain_with": skill.can_chain_with,
                     "why_selected": match["reason"],
                     "activation": {
                         "confidence": match["confidence"],
@@ -476,51 +488,51 @@ class SkillRuntime:
                     },
                     "manifest_hash": self._hash_if_exists(skill, skill.entrypoint),
                     "manifest_summary": manifest_summary,
-                    "operating_rules": operating_rules,
                     "retrieved_docs": docs,
-                    "evidence": evidence,
+                    "answer_readiness": answer_readiness,
                     "tool_policy": skill.policy if include_policy else {},
                     "recommended_tools": (
                         self._recommended_tools(skill) if include_recommended_tools else []
                     ),
-                    "response_contract": response_contract,
-                    "answer_readiness": answer_readiness,
                     "execution_guidance": self._execution_guidance(skill, manifest_summary, docs),
-                    "validation_guidance": self._validation_guidance(skill),
                 }
-            )
+            selected.append(selected_packet)
 
-        ready = bool(selected) and not truncated and all(
-            skill_packet["answer_readiness"]["ready"] for skill_packet in selected
-        )
-        need_more_context = not ready
-        stop_condition = {
-            "satisfied": ready,
-            "reason": self._stop_reason(selected, truncated),
+        ready = bool(selected) and not truncated and not not_ready_skill_ids
+        stop_reason = self._stop_reason(selected, truncated, not_ready_skill_ids)
+        decision = {
+            "ready": ready,
+            "next_action": "answer" if ready else "searchSkillDocs",
+            "reason": stop_reason,
+            "stop": ready,
         }
-        return {
+        result: dict[str, Any] = {
             "selected_skills": selected,
-            "composition_plan": self._composition_plan(selected, allow_skill_chaining),
             "retrieval_budget": {
-                "max_skills": max_skills,
-                "effective_max_skills": effective_max_skills,
                 "max_docs": max_docs,
                 "max_chars": max_chars,
                 "used_docs": used_docs,
-                "used_chars": used_chars,
                 "truncated": truncated,
             },
-            "stop_condition": stop_condition,
-            "answer_readiness": {
-                "ready": ready,
-                "reason": stop_condition["reason"],
-                "recommended_next_action": "answer" if ready else "searchSkillDocs",
-            },
-            "need_more_context": need_more_context,
-            "recommended_next_action": "searchSkillDocs" if need_more_context else "answer",
-            "fallback_queries": self._fallback_queries(query, selected),
-            "reason": stop_condition["reason"],
+            "decision": decision,
         }
+        if not ready:
+            result["fallback_queries"] = self._fallback_queries(query, selected)
+        if include_debug:
+            result["debug"] = {
+                "composition_plan": self._composition_plan(selected, allow_skill_chaining),
+                "retrieval_budget": {
+                    "max_skills": max_skills,
+                    "effective_max_skills": effective_max_skills,
+                    "max_docs": max_docs,
+                    "max_chars": max_chars,
+                    "used_docs": used_docs,
+                    "used_chars": used_chars,
+                    "truncated": truncated,
+                },
+                "fallback_queries": self._fallback_queries(query, selected),
+            }
+        return result
 
     def search(
         self,
@@ -1061,35 +1073,44 @@ class SkillRuntime:
             "recommended_next_action": "searchSkillDocs",
         }
 
-    def _evidence(self, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _evidence(
+        self,
+        docs: list[dict[str, Any]],
+        include_debug: bool = False,
+    ) -> list[dict[str, Any]]:
         evidence: list[dict[str, Any]] = []
         for doc in docs:
-            evidence.append(
-                {
-                    "path": doc["path"],
-                    "section": doc.get("heading_path") or doc.get("title"),
-                    "score": doc.get("score"),
-                    "why_relevant": doc.get("why_relevant", "Matched by keyword search."),
-                    "rank_features": doc.get("rank_features", {}),
-                }
-            )
+            item: dict[str, Any] = {
+                "path": doc["path"],
+                "section": doc.get("heading_path") or doc.get("title"),
+                "why_relevant": doc.get("why_relevant", "Matched by keyword search."),
+            }
+            if include_debug:
+                item["score"] = doc.get("score")
+                item["rank_features"] = doc.get("rank_features", {})
+            evidence.append(item)
         return evidence
 
-    def _stop_reason(self, selected: list[dict[str, Any]], truncated: bool) -> str:
+    def _stop_reason(
+        self,
+        selected: list[dict[str, Any]],
+        truncated: bool,
+        not_ready_skill_ids: list[str],
+    ) -> str:
         if truncated:
             return "Context budget was exhausted."
         if not selected:
             return "No skill matched the task."
-        not_ready = [item["skill_id"] for item in selected if not item["answer_readiness"]["ready"]]
-        if not_ready:
-            return f"More context is needed for: {', '.join(not_ready)}."
+        if not_ready_skill_ids:
+            return f"More context is needed for: {', '.join(not_ready_skill_ids)}."
         return "Selected skill context is sufficient to answer."
 
     def _fallback_queries(self, query: str, selected: list[dict[str, Any]]) -> list[str]:
         fallback = [query]
         for packet in selected:
             tags = packet.get("capability_tags", [])[:4]
-            paths = [doc["path"] for doc in packet.get("retrieved_docs", [])[:2]]
+            docs = packet.get("debug", {}).get("retrieved_docs", [])
+            paths = [doc["path"] for doc in docs[:2]]
             if tags:
                 fallback.append(" ".join([packet["skill_id"], *tags]))
             if paths:

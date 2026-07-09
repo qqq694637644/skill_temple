@@ -29,7 +29,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["matches"][0]["skill_id"], "idapython")
         self.assertGreater(result["matches"][0]["confidence"], 0.5)
 
-    def test_retrieve_returns_manifest_summary_and_docs(self) -> None:
+    def test_retrieve_returns_compact_decision_packet_by_default(self) -> None:
         runtime = load_runtime()
 
         result = runtime.retrieve(
@@ -40,20 +40,41 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(result["selected_skills"])
         selected = result["selected_skills"][0]
         self.assertEqual(selected["skill_id"], "idapython")
-        self.assertTrue(selected["manifest_summary"]["critical_rules"])
-        self.assertTrue(selected["manifest_summary"]["module_router"])
-        self.assertTrue(selected["retrieved_docs"])
-        self.assertEqual(selected["skill_type"], "tool_doc")
         self.assertIn("reverse_engineering", selected["capability_tags"])
         self.assertEqual(selected["role"], "primary")
-        self.assertTrue(selected["answer_readiness"]["ready"])
         self.assertTrue(selected["operating_rules"])
         self.assertTrue(selected["evidence"])
         self.assertTrue(selected["response_contract"]["expected_output"])
-        self.assertTrue(result["answer_readiness"]["ready"])
-        self.assertTrue(result["stop_condition"]["satisfied"])
+        self.assertTrue(selected["validation_guidance"])
+        self.assertNotIn("manifest_summary", selected)
+        self.assertNotIn("retrieved_docs", selected)
+        self.assertNotIn("rank_features", selected["evidence"][0])
+        self.assertNotIn("debug", result)
+        self.assertTrue(result["decision"]["ready"])
+        self.assertTrue(result["decision"]["stop"])
+        self.assertEqual(result["decision"]["next_action"], "answer")
         self.assertGreaterEqual(result["retrieval_budget"]["used_docs"], 1)
-        self.assertEqual(result["recommended_next_action"], "answer")
+        self.assertNotIn("used_chars", result["retrieval_budget"])
+        self.assertNotIn("fallback_queries", result)
+
+    def test_retrieve_debug_includes_diagnostics(self) -> None:
+        runtime = load_runtime()
+
+        result = runtime.retrieve(
+            "@idapython write a script to find xrefs to strcpy",
+            hinted_skill_ids=["idapython"],
+            include_debug=True,
+        )
+
+        selected = result["selected_skills"][0]
+        self.assertIn("debug", selected)
+        self.assertTrue(selected["debug"]["manifest_summary"]["critical_rules"])
+        self.assertTrue(selected["debug"]["manifest_summary"]["module_router"])
+        self.assertTrue(selected["debug"]["retrieved_docs"])
+        self.assertIn("rank_features", selected["evidence"][0])
+        self.assertIn("debug", result)
+        self.assertIn("used_chars", result["debug"]["retrieval_budget"])
+        self.assertIn("fallback_queries", result["debug"])
 
     def test_search_returns_relevant_doc_excerpt(self) -> None:
         runtime = load_runtime()
@@ -140,7 +161,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(retrieve_response.status_code, 200)
         retrieve_body = retrieve_response.json()
         self.assertEqual(retrieve_body["selected_skills"][0]["skill_id"], "idapython")
-        self.assertTrue(retrieve_body["answer_readiness"]["ready"])
+        self.assertTrue(retrieve_body["decision"]["ready"])
 
     def test_http_expected_errors_are_structured(self) -> None:
         client = TestClient(create_app())
@@ -216,7 +237,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(result["selected_skills"][0]["skill_id"], "demo")
             self.assertEqual(
-                result["selected_skills"][0]["retrieved_docs"][0]["path"],
+                result["selected_skills"][0]["evidence"][0]["path"],
                 "docs/demo.md",
             )
 
@@ -256,13 +277,18 @@ class RuntimeTests(unittest.TestCase):
 
             runtime = SkillRuntime(skills_root)
             single = runtime.retrieve("shared-task")
-            chained = runtime.retrieve("shared-task", max_skills=2, allow_skill_chaining=True)
+            chained = runtime.retrieve(
+                "shared-task",
+                max_skills=2,
+                allow_skill_chaining=True,
+                include_debug=True,
+            )
 
             self.assertEqual(len(single["selected_skills"]), 1)
             self.assertEqual(len(chained["selected_skills"]), 2)
             self.assertEqual(chained["selected_skills"][0]["role"], "primary")
             self.assertEqual(chained["selected_skills"][1]["role"], "secondary")
-            self.assertTrue(chained["composition_plan"]["enabled"])
+            self.assertTrue(chained["debug"]["composition_plan"]["enabled"])
 
     def test_skill_chaining_respects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

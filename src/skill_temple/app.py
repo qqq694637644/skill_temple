@@ -54,6 +54,10 @@ class RetrieveSkillContextRequest(BaseModel):
         default=False,
         description="Allow multiple cooperating skills in one retrieval result.",
     )
+    include_debug: bool = Field(
+        default=False,
+        description="Return diagnostic fields such as manifest summaries and raw retrieved docs.",
+    )
 
 
 class SearchSkillDocsRequest(BaseModel):
@@ -175,6 +179,7 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
                 include_policy=request.include_policy,
                 include_recommended_tools=request.include_recommended_tools,
                 allow_skill_chaining=request.allow_skill_chaining,
+                include_debug=request.include_debug,
             )
         except SkillNotFoundError as exc:
             detail = structured_error("skill_not_found", str(exc), "check_skill_id")

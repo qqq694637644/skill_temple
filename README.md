@@ -8,7 +8,8 @@ The intended pattern is:
 Custom GPT Instructions
   -> call retrieveSkillContext for skill-backed tasks
   -> call searchSkillDocs or readSkillContent only when more precision is needed
-  -> use the returned manifest rules, policy, docs, and validation guidance
+  -> use the returned decision, operating rules, evidence, response contract,
+     and validation guidance
 ```
 
 This repository includes a minimal example `idapython` skill. In production, point `SKILL_TEMPLE_SKILLS_DIR` at your own skills directory.
@@ -22,13 +23,12 @@ failures should be visible in tests and during endpoint calls.
 Custom GPT Knowledge is useful as a reference source, but it is not a deterministic skill filesystem. For multiple skills, a GPT Action gateway gives you:
 
 - skill resolution by user task and explicit hints such as `@idapython`
-- compact manifest summaries and policy rules
+- compact operating rules and response contracts
 - local documentation search with bounded retrieval budgets
 - precise safe-path file reading
 - version/hash metadata for auditability
 - a small OpenAPI surface that is easier for GPT-5.5 to use reliably
-- decision-packet fields such as answer readiness, response contract, evidence,
-  rank features, and stop conditions
+- a compact GPT-facing decision packet plus optional debug diagnostics
 
 ## API surface
 
@@ -70,17 +70,17 @@ Search results include `rank_features` to explain why a result was selected:
 
 ## Decision packet
 
-`retrieveSkillContext` returns a decision packet, not just raw documentation. Key fields:
+`retrieveSkillContext` defaults to a compact GPT-facing decision packet, not a
+debug report. Key fields:
 
 ```json
 {
   "selected_skills": [
     {
       "skill_id": "idapython",
-      "skill_type": "tool_doc",
-      "capability_tags": ["reverse_engineering", "ida_pro"],
       "role": "primary",
-      "activation": {"confidence": 0.99, "hinted": true},
+      "confidence": 0.99,
+      "capability_tags": ["reverse_engineering", "ida_pro"],
       "operating_rules": ["Use modern ida_* modules."],
       "evidence": [
         {
@@ -94,23 +94,31 @@ Search results include `rank_features` to explain why a result was selected:
         "must_include": ["Call ida_auto.auto_wait() before reading analysis results."],
         "evidence_paths": ["docs/ida_hexrays.md"]
       },
-      "answer_readiness": {
-        "ready": true,
-        "recommended_next_action": "answer"
+      "validation_guidance": {
+        "suggested_checks": ["Confirm the script is read-only unless mutation is requested."]
       }
     }
   ],
   "retrieval_budget": {
+    "max_docs": 6,
+    "max_chars": 12000,
     "used_docs": 3,
-    "used_chars": 4820,
     "truncated": false
   },
-  "stop_condition": {
-    "satisfied": true,
-    "reason": "Selected skill context is sufficient to answer."
+  "decision": {
+    "ready": true,
+    "next_action": "answer",
+    "reason": "Selected skill context is sufficient to answer.",
+    "stop": true
   }
 }
 ```
+
+Set `include_debug=true` only for development, evals, or retrieval tuning. Debug
+mode adds diagnostic fields such as `manifest_summary`, raw `retrieved_docs`,
+`rank_features` inside evidence, `composition_plan`, `used_chars`, and
+`fallback_queries` even when the decision is ready. Without debug mode,
+`fallback_queries` is returned only when `decision.ready=false`.
 
 By default, retrieval returns one primary skill. Set `allow_skill_chaining=true`
 and increase `max_skills` to return secondary supporting skills. Chaining is
@@ -233,8 +241,8 @@ Invoke-RestMethod http://127.0.0.1:8765/v1/skills/read `
 When a user task appears to require a reusable skill, use retrieveSkillContext
 with the user's task and any explicit skill hint, such as @idapython.
 
-Use the returned manifest rules as the behavioral source of truth.
-Use the returned docs as the initial evidence.
+Use the returned operating_rules, evidence, response_contract, and
+validation_guidance as the behavioral source of truth.
 Call searchSkillDocs or readSkillContent only when the retrieved context is
 insufficient for the user's concrete request.
 

@@ -39,7 +39,7 @@ def evaluate_case(case: dict[str, Any], skills_dir: Path | None = None) -> dict[
     expected_skill = str(case["expected_skill"])
     hinted_skill_ids = [expected_skill] if case.get("use_hint", True) else []
 
-    retrieve = runtime.retrieve(query, hinted_skill_ids=hinted_skill_ids)
+    retrieve = runtime.retrieve(query, hinted_skill_ids=hinted_skill_ids, include_debug=True)
     selected_skills = retrieve.get("selected_skills", [])
     selected_skill_ids = [skill["skill_id"] for skill in selected_skills]
     top_skill_ok = bool(selected_skill_ids) and selected_skill_ids[0] == expected_skill
@@ -47,7 +47,7 @@ def evaluate_case(case: dict[str, Any], skills_dir: Path | None = None) -> dict[
     retrieved_paths = [
         doc["path"]
         for skill in selected_skills
-        for doc in skill.get("retrieved_docs", [])
+        for doc in skill.get("debug", {}).get("retrieved_docs", [])
     ]
     expected_paths = [str(path) for path in case.get("expected_paths", [])]
     missing_paths = [path for path in expected_paths if path not in retrieved_paths]
