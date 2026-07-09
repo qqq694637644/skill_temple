@@ -19,14 +19,17 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from .runtime import SkillNotFoundError, SkillPathError, SkillRuntime, load_runtime
+from .runtime import SkillNotFoundError, SkillPathError, load_runtime
 
 
 class ResolveSkillRequest(BaseModel):
     query: str = Field(..., description="The user's task or request text.")
     hinted_skill_ids: list[str] = Field(
         default_factory=list,
-        description="Optional explicit skill hints, for example ['idapython'] when user writes @idapython.",
+        description=(
+            "Optional explicit skill hints, for example ['idapython'] "
+            "when user writes @idapython."
+        ),
     )
     max_results: int = Field(default=3, ge=1, le=10)
 
@@ -35,7 +38,10 @@ class RetrieveSkillContextRequest(BaseModel):
     query: str = Field(..., description="The user's original task or request text.")
     hinted_skill_ids: list[str] = Field(
         default_factory=list,
-        description="Optional explicit skill hints, for example ['idapython'] when user writes @idapython.",
+        description=(
+            "Optional explicit skill hints, for example ['idapython'] "
+            "when user writes @idapython."
+        ),
     )
     max_skills: int = Field(default=1, ge=1, le=5)
     max_docs: int = Field(default=6, ge=1, le=20)
@@ -64,7 +70,10 @@ class SearchSkillDocsRequest(BaseModel):
 
 class ReadSkillContentRequest(BaseModel):
     skill_id: str = Field(..., description="Skill id to read from, such as 'idapython'.")
-    path: str = Field(..., description="Safe relative path inside the skill, for example docs/ida_hexrays.md.")
+    path: str = Field(
+        ...,
+        description="Safe relative path inside the skill, for example docs/ida_hexrays.md.",
+    )
     start_line: int = Field(default=1, ge=1)
     max_lines: int = Field(default=200, ge=1, le=2000)
     max_chars: int = Field(default=16_000, ge=100, le=100_000)
@@ -125,7 +134,10 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
     @app.post(
         "/v1/skills/retrieve",
         operation_id="retrieveSkillContext",
-        summary="Retrieve the best matching skill rules and relevant documentation for a user task.",
+        summary=(
+            "Retrieve the best matching skill rules and relevant documentation "
+            "for a user task."
+        ),
         description=(
             "Use this as the default first Action call when a task may require a reusable skill, "
             "including explicit hints such as @idapython. The endpoint selects relevant skills, "
@@ -198,7 +210,12 @@ app = create_app()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Skill Temple GPT Action gateway.")
-    parser.add_argument("--skills-dir", type=Path, default=None, help="Directory containing skill folders.")
+    parser.add_argument(
+        "--skills-dir",
+        type=Path,
+        default=None,
+        help="Directory containing skill folders.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()

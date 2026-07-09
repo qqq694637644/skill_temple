@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -233,7 +234,8 @@ class SkillRuntime:
         if not self.skills_dir.is_dir():
             raise NotADirectoryError(f"Skills path is not a directory: {self.skills_dir}")
         self._skills = self._load_skills()
-        self._search_db = sqlite3.connect(":memory:")
+        self._search_lock = threading.RLock()
+        self._search_db = sqlite3.connect(":memory:", check_same_thread=False)
         self._search_db.row_factory = sqlite3.Row
         self._build_search_index()
 
@@ -306,7 +308,9 @@ class SkillRuntime:
                     score += 3.0
                     reasons.append(f"matched trigger term {term!r}")
 
-            metadata_tokens = set(_tokens(" ".join([skill.name, skill.description, *skill.aliases])))
+            metadata_tokens = set(
+                _tokens(" ".join([skill.name, skill.description, *skill.aliases]))
+            )
             overlap = query_tokens & metadata_tokens
             if overlap:
                 score += min(5.0, len(overlap) * 0.75)
@@ -382,7 +386,9 @@ class SkillRuntime:
                     "manifest_summary": manifest_summary,
                     "retrieved_docs": docs,
                     "tool_policy": skill.policy if include_policy else {},
-                    "recommended_tools": self._recommended_tools(skill) if include_recommended_tools else [],
+                    "recommended_tools": (
+                        self._recommended_tools(skill) if include_recommended_tools else []
+                    ),
                     "execution_guidance": self._execution_guidance(skill, manifest_summary, docs),
                     "validation_guidance": self._validation_guidance(skill),
                 }
@@ -399,7 +405,11 @@ class SkillRuntime:
             },
             "need_more_context": need_more_context,
             "recommended_next_action": "searchSkillDocs" if need_more_context else "answer",
-            "reason": "Context budget was exhausted." if truncated else "Retrieved sufficient context.",
+            "reason": (
+                "Context budget was exhausted."
+                if truncated
+                else "Retrieved sufficient context."
+            ),
         }
 
     def search(
@@ -540,53 +550,56 @@ class SkillRuntime:
     def _build_search_index(self) -> None:
         """Build an in-memory FTS5 index for all loaded skills."""
 
-        try:
-            self._search_db.execute(
-                """
-                CREATE VIRTUAL TABLE skill_docs_fts USING fts5(
-                    skill_id,
-                    path,
-                    title,
-                    heading_path,
-                    content,
-                    symbols,
-                    tags,
-                    start_line UNINDEXED,
-                    end_line UNINDEXED,
-                    doc_kind UNINDEXED,
-                    priority UNINDEXED,
-                    content_hash UNINDEXED
-                )
-                """
-            )
-        except sqlite3.OperationalError as exc:  # pragma: no cover - platform dependent
-            raise SkillRuntimeError("SQLite FTS5 support is required for keyword search") from exc
-
-        for skill in self._skills.values():
-            for chunk in self._iter_search_chunks(skill):
+        with self._search_lock:
+            try:
                 self._search_db.execute(
                     """
-                    INSERT INTO skill_docs_fts(
-                        skill_id, path, title, heading_path, content, symbols, tags,
-                        start_line, end_line, doc_kind, priority, content_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    CREATE VIRTUAL TABLE skill_docs_fts USING fts5(
+                        skill_id,
+                        path,
+                        title,
+                        heading_path,
+                        content,
+                        symbols,
+                        tags,
+                        start_line UNINDEXED,
+                        end_line UNINDEXED,
+                        doc_kind UNINDEXED,
+                        priority UNINDEXED,
+                        content_hash UNINDEXED
+                    )
                     """,
-                    (
-                        skill.skill_id,
-                        chunk["path"],
-                        chunk["title"],
-                        chunk["heading_path"],
-                        chunk["content"],
-                        " ".join(chunk["symbols"]),
-                        " ".join(chunk["tags"]),
-                        chunk["start_line"],
-                        chunk["end_line"],
-                        chunk["doc_kind"],
-                        chunk["priority"],
-                        chunk["content_hash"],
-                    ),
                 )
-        self._search_db.commit()
+            except sqlite3.OperationalError as exc:  # pragma: no cover - platform dependent
+                raise SkillRuntimeError(
+                    "SQLite FTS5 support is required for keyword search"
+                ) from exc
+
+            for skill in self._skills.values():
+                for chunk in self._iter_search_chunks(skill):
+                    self._search_db.execute(
+                        """
+                        INSERT INTO skill_docs_fts(
+                            skill_id, path, title, heading_path, content, symbols, tags,
+                            start_line, end_line, doc_kind, priority, content_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            skill.skill_id,
+                            chunk["path"],
+                            chunk["title"],
+                            chunk["heading_path"],
+                            chunk["content"],
+                            " ".join(chunk["symbols"]),
+                            " ".join(chunk["tags"]),
+                            chunk["start_line"],
+                            chunk["end_line"],
+                            chunk["doc_kind"],
+                            chunk["priority"],
+                            chunk["content_hash"],
+                        ),
+                    )
+            self._search_db.commit()
 
     def _iter_search_chunks(self, skill: Skill) -> list[dict[str, Any]]:
         doc_metadata = self._doc_metadata(skill)
@@ -627,7 +640,11 @@ class SkillRuntime:
 
         chunks: list[dict[str, Any]] = []
         for position, start_index in enumerate(heading_indices):
-            end_index = heading_indices[position + 1] if position + 1 < len(heading_indices) else len(lines)
+            end_index = (
+                heading_indices[position + 1]
+                if position + 1 < len(heading_indices)
+                else len(lines)
+            )
             section_lines = lines[start_index:end_index]
             if not section_lines:
                 continue
@@ -721,18 +738,19 @@ class SkillRuntime:
         if not match_query:
             return []
 
-        rows = self._search_db.execute(
-            """
-            SELECT rowid, skill_id, path, title, heading_path, content, symbols, tags,
-                   start_line, end_line, doc_kind, priority, content_hash,
-                   bm25(skill_docs_fts) AS bm25_rank
-            FROM skill_docs_fts
-            WHERE skill_docs_fts MATCH ? AND skill_id = ?
-            ORDER BY bm25_rank
-            LIMIT 200
-            """,
-            (match_query, skill.skill_id),
-        ).fetchall()
+        with self._search_lock:
+            rows = self._search_db.execute(
+                """
+                SELECT rowid, skill_id, path, title, heading_path, content, symbols, tags,
+                       start_line, end_line, doc_kind, priority, content_hash,
+                       bm25(skill_docs_fts) AS bm25_rank
+                FROM skill_docs_fts
+                WHERE skill_docs_fts MATCH ? AND skill_id = ?
+                ORDER BY bm25_rank
+                LIMIT 200
+                """,
+                (match_query, skill.skill_id),
+            ).fetchall()
 
         query_terms = set(_tokens(query))
         query_symbols = set(self._extract_symbols(query))
@@ -830,7 +848,11 @@ class SkillRuntime:
         }
 
     def _recommended_tools(self, skill: Skill) -> list[str]:
-        tools = skill.metadata.get("required_actions") or skill.metadata.get("recommended_tools") or []
+        tools = (
+            skill.metadata.get("required_actions")
+            or skill.metadata.get("recommended_tools")
+            or []
+        )
         return [str(tool) for tool in tools]
 
     def _execution_guidance(

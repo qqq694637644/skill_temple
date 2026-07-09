@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
 from skill_temple.app import create_app
 from skill_temple.runtime import SkillPathError, SkillRuntime, load_runtime
 
@@ -91,6 +93,40 @@ class RuntimeTests(unittest.TestCase):
             operation_ids,
             {"retrieveSkillContext", "searchSkillDocs", "readSkillContent"},
         )
+
+    def test_http_endpoints_work_through_testclient(self) -> None:
+        client = TestClient(create_app())
+
+        read_response = client.post(
+            "/v1/skills/read",
+            json={"skill_id": "idapython", "path": "SKILL.md", "max_lines": 5},
+        )
+        self.assertEqual(read_response.status_code, 200)
+        self.assertIn("name: idapython", read_response.json()["content"])
+
+        search_response = client.post(
+            "/v1/skills/search",
+            json={
+                "skill_id": "idapython",
+                "query": "ctree_visitor_t cot_call",
+                "mode": "keyword",
+            },
+        )
+        self.assertEqual(search_response.status_code, 200)
+        search_body = search_response.json()
+        self.assertEqual(search_body["engine"], "sqlite_fts5_symbol_index")
+        self.assertEqual(search_body["matches"][0]["path"], "docs/ida_hexrays.md")
+
+        retrieve_response = client.post(
+            "/v1/skills/retrieve",
+            json={
+                "query": "@idapython write a script to find xrefs to strcpy",
+                "hinted_skill_ids": ["idapython"],
+            },
+        )
+        self.assertEqual(retrieve_response.status_code, 200)
+        retrieve_body = retrieve_response.json()
+        self.assertEqual(retrieve_body["selected_skills"][0]["skill_id"], "idapython")
 
     def test_runtime_can_load_external_skill_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
