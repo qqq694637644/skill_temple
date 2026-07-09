@@ -1,0 +1,2 @@
+{"id":"idapython-xrefs","query":"@idapython write a script to find xrefs to strcpy","expected_skill":"idapython","expected_paths":["docs/idautils.md"],"expected_symbols":["XrefsTo"]}
+{"id":"idapython-ctree","query":"@idapython walk ctree calls with ctree_visitor_t cot_call","expected_skill":"idapython","expected_paths":["docs/ida_hexrays.md"],"expected_symbols":["ctree_visitor_t","cot_call"]}
