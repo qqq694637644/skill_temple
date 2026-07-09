@@ -163,18 +163,22 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
         ),
     )
     def retrieve_skill_context(request: RetrieveSkillContextRequest) -> dict[str, object]:
-        return runtime.retrieve(
-            query=request.query,
-            hinted_skill_ids=request.hinted_skill_ids,
-            max_skills=request.max_skills,
-            max_docs=request.max_docs,
-            max_chars=request.max_chars,
-            detail_level=request.detail_level,
-            include_manifest=request.include_manifest,
-            include_policy=request.include_policy,
-            include_recommended_tools=request.include_recommended_tools,
-            allow_skill_chaining=request.allow_skill_chaining,
-        )
+        try:
+            return runtime.retrieve(
+                query=request.query,
+                hinted_skill_ids=request.hinted_skill_ids,
+                max_skills=request.max_skills,
+                max_docs=request.max_docs,
+                max_chars=request.max_chars,
+                detail_level=request.detail_level,
+                include_manifest=request.include_manifest,
+                include_policy=request.include_policy,
+                include_recommended_tools=request.include_recommended_tools,
+                allow_skill_chaining=request.allow_skill_chaining,
+            )
+        except SkillNotFoundError as exc:
+            detail = structured_error("skill_not_found", str(exc), "check_skill_id")
+            raise HTTPException(status_code=404, detail=detail) from exc
 
     @app.post(
         "/v1/skills/search",

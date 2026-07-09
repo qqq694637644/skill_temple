@@ -153,6 +153,28 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"]["error"]["code"], "skill_not_found")
 
+        path_response = client.post(
+            "/v1/skills/read",
+            json={"skill_id": "idapython", "path": "../README.md"},
+        )
+
+        self.assertEqual(path_response.status_code, 404)
+        self.assertEqual(
+            path_response.json()["detail"]["error"]["code"],
+            "unsafe_or_missing_path",
+        )
+
+        retrieve_response = client.post(
+            "/v1/skills/retrieve",
+            json={"query": "@missing do something", "hinted_skill_ids": ["missing"]},
+        )
+
+        self.assertEqual(retrieve_response.status_code, 404)
+        self.assertEqual(
+            retrieve_response.json()["detail"]["error"]["code"],
+            "skill_not_found",
+        )
+
     def test_eval_file_passes_packaged_skill_queries(self) -> None:
         report = evaluate_file(Path("evals/skill_queries.jsonl"))
 
@@ -218,6 +240,7 @@ class RuntimeTests(unittest.TestCase):
                             "entrypoint": "SKILL.md",
                             "docs": [{"path": "docs/shared.md", "title": "shared"}],
                             "capability_tags": [skill_id, "shared"],
+                            "can_chain_with": ["beta" if skill_id == "alpha" else "alpha"],
                         }
                     ),
                     encoding="utf-8",
@@ -240,6 +263,85 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(chained["selected_skills"][0]["role"], "primary")
             self.assertEqual(chained["selected_skills"][1]["role"], "secondary")
             self.assertTrue(chained["composition_plan"]["enabled"])
+
+    def test_skill_chaining_respects_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            skills_root = tmp_path / "skills"
+            for skill_id, conflict in [("alpha", "beta"), ("beta", "alpha")]:
+                skill_root = skills_root / skill_id
+                docs_root = skill_root / "docs"
+                docs_root.mkdir(parents=True)
+                (skill_root / "skill.json").write_text(
+                    json.dumps(
+                        {
+                            "skill_id": skill_id,
+                            "name": skill_id,
+                            "version": "1",
+                            "description": f"{skill_id} skill for shared task.",
+                            "aliases": [f"@{skill_id}"],
+                            "activation": {"trigger_terms": ["shared-task"]},
+                            "entrypoint": "SKILL.md",
+                            "docs": [{"path": "docs/shared.md", "title": "shared"}],
+                            "conflicts_with": [conflict],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (skill_root / "SKILL.md").write_text(
+                    f"# {skill_id}\n\n## Critical Rules\n\n1. Use {skill_id}.\n",
+                    encoding="utf-8",
+                )
+                (docs_root / "shared.md").write_text(
+                    f"# Shared\n\nshared-task content for {skill_id}.\n",
+                    encoding="utf-8",
+                )
+
+            runtime = SkillRuntime(skills_root)
+            chained = runtime.retrieve("shared-task", max_skills=2, allow_skill_chaining=True)
+
+            self.assertEqual(len(chained["selected_skills"]), 1)
+
+    def test_skill_chaining_respects_can_chain_with_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            skills_root = tmp_path / "skills"
+            for skill_id in ["alpha", "beta", "gamma"]:
+                skill_root = skills_root / skill_id
+                docs_root = skill_root / "docs"
+                docs_root.mkdir(parents=True)
+                metadata = {
+                    "skill_id": skill_id,
+                    "name": skill_id,
+                    "version": "1",
+                    "description": f"{skill_id} skill for shared task.",
+                    "aliases": [f"@{skill_id}"],
+                    "activation": {"trigger_terms": ["shared-task"]},
+                    "entrypoint": "SKILL.md",
+                    "docs": [{"path": "docs/shared.md", "title": "shared"}],
+                }
+                if skill_id == "alpha":
+                    metadata["can_chain_with"] = ["gamma"]
+                if skill_id == "gamma":
+                    metadata["can_chain_with"] = ["alpha"]
+
+                (skill_root / "skill.json").write_text(json.dumps(metadata), encoding="utf-8")
+                (skill_root / "SKILL.md").write_text(
+                    f"# {skill_id}\n\n## Critical Rules\n\n1. Use {skill_id}.\n",
+                    encoding="utf-8",
+                )
+                (docs_root / "shared.md").write_text(
+                    f"# Shared\n\nshared-task content for {skill_id}.\n",
+                    encoding="utf-8",
+                )
+
+            runtime = SkillRuntime(skills_root)
+            chained = runtime.retrieve("shared-task", max_skills=3, allow_skill_chaining=True)
+
+            self.assertEqual(
+                [skill["skill_id"] for skill in chained["selected_skills"]],
+                ["alpha", "gamma"],
+            )
 
 
 if __name__ == "__main__":

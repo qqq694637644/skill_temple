@@ -113,7 +113,14 @@ Search results include `rank_features` to explain why a result was selected:
 ```
 
 By default, retrieval returns one primary skill. Set `allow_skill_chaining=true`
-and increase `max_skills` to return secondary supporting skills.
+and increase `max_skills` to return secondary supporting skills. Chaining is
+constrained by metadata:
+
+- `conflicts_with` is enforced symmetrically; conflicting skills are not returned
+  together.
+- `can_chain_with` is treated as an allowlist when present. If a skill declares
+  it, secondary skills must be listed there, and the relationship must not be
+  blocked by the other skill's own allowlist.
 
 ## Skill directory layout
 
@@ -259,8 +266,11 @@ The eval runner exits non-zero on failures so it can be used in CI later.
 
 ## Error behavior
 
-Known input errors return structured details. Unexpected runtime failures are not
-wrapped because this project is still in active development.
+Known input errors return structured details. This includes explicit missing
+skill IDs in `searchSkillDocs`, `readSkillContent`, and `retrieveSkillContext`
+`hinted_skill_ids`, plus unsafe or missing paths in read/search path filters.
+Unexpected runtime failures are not wrapped because this project is still in
+active development.
 
 ```json
 {

@@ -354,6 +354,48 @@ class SkillRuntime:
         matches.sort(key=lambda item: item["score"], reverse=True)
         return {"matches": matches[:max_results]}
 
+    def _validate_hinted_skill_ids(self, hinted_skill_ids: list[str] | None) -> None:
+        for skill_id in hinted_skill_ids or []:
+            self._get_skill(skill_id)
+
+    def _select_chainable_matches(
+        self,
+        matches: list[dict[str, Any]],
+        max_skills: int,
+        allow_skill_chaining: bool,
+    ) -> list[dict[str, Any]]:
+        if not matches or max_skills <= 0:
+            return []
+        if not allow_skill_chaining:
+            return matches[:1]
+
+        selected: list[dict[str, Any]] = []
+        for match in matches:
+            candidate = self._get_skill(match["skill_id"])
+            if selected and not self._can_add_to_chain(candidate, selected):
+                continue
+            selected.append(match)
+            if len(selected) >= max_skills:
+                break
+        return selected
+
+    def _can_add_to_chain(self, candidate: Skill, selected_matches: list[dict[str, Any]]) -> bool:
+        for selected_match in selected_matches:
+            selected_skill = self._get_skill(selected_match["skill_id"])
+            if self._skills_conflict(selected_skill, candidate):
+                return False
+            if not self._skills_can_chain(selected_skill, candidate):
+                return False
+        return True
+
+    def _skills_conflict(self, first: Skill, second: Skill) -> bool:
+        return second.skill_id in first.conflicts_with or first.skill_id in second.conflicts_with
+
+    def _skills_can_chain(self, first: Skill, second: Skill) -> bool:
+        first_allows = not first.can_chain_with or second.skill_id in first.can_chain_with
+        second_allows = not second.can_chain_with or first.skill_id in second.can_chain_with
+        return first_allows and second_allows
+
     def retrieve(
         self,
         query: str,
@@ -369,11 +411,17 @@ class SkillRuntime:
     ) -> dict[str, Any]:
         """Retrieve sufficient skill context for a user task in one call."""
 
+        self._validate_hinted_skill_ids(hinted_skill_ids)
         effective_max_skills = max_skills if allow_skill_chaining else 1
         resolved = self.resolve(
             query,
             hinted_skill_ids=hinted_skill_ids,
-            max_results=effective_max_skills,
+            max_results=max(len(self._skills), effective_max_skills),
+        )
+        selected_matches = self._select_chainable_matches(
+            resolved["matches"],
+            max_skills=effective_max_skills,
+            allow_skill_chaining=allow_skill_chaining,
         )
         selected: list[dict[str, Any]] = []
         budget_remaining = max_chars
@@ -381,7 +429,7 @@ class SkillRuntime:
         used_docs = 0
         truncated = False
 
-        for index, match in enumerate(resolved["matches"][:effective_max_skills]):
+        for index, match in enumerate(selected_matches):
             skill = self._get_skill(match["skill_id"])
             manifest_text = self._read_skill_file(skill, skill.entrypoint, max_chars=6000)
             manifest_summary = self._manifest_summary(manifest_text) if include_manifest else {}
