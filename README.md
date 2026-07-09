@@ -134,9 +134,10 @@ The GPT Action request schema for `retrieveSkillContext` is intentionally small:
 Other retrieval tuning knobs remain runtime-level API parameters, but are not
 exposed in the default GPT Action request model.
 
-By default, retrieval returns one primary skill. Set `allow_skill_chaining=true`
-and increase `max_skills` to return secondary supporting skills. Chaining is
-constrained by metadata:
+By default, the GPT Action endpoint returns one primary skill. Set
+`allow_skill_chaining=true` to allow up to three chain-compatible supporting
+skills. The lower-level Python runtime API still exposes `max_skills` for
+tuning. Chaining is constrained by metadata:
 
 - `conflicts_with` is enforced symmetrically; conflicting skills are not returned
   together.
