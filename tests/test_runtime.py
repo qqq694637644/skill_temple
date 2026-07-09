@@ -137,8 +137,19 @@ class RuntimeTests(unittest.TestCase):
         retrieve_fields = set(retrieve_schema["properties"])
         self.assertEqual(
             retrieve_fields,
-            {"query", "hinted_skill_ids", "max_docs", "allow_skill_chaining", "include_debug"},
+            {"query", "hinted_skill_ids", "max_docs", "allow_skill_chaining"},
         )
+        search_schema = app.openapi()["components"]["schemas"]["SearchSkillDocsRequest"]
+        self.assertEqual(set(search_schema["properties"]), {"skill_id", "query", "paths", "limit"})
+        read_schema = app.openapi()["components"]["schemas"]["ReadSkillContentRequest"]
+        self.assertEqual(
+            set(read_schema["properties"]),
+            {"skill_id", "path", "start_line", "max_lines"},
+        )
+
+        retrieve_response = app.openapi()["components"]["schemas"]["RetrieveSkillContextResponse"]
+        self.assertIn("selected_skills", retrieve_response["properties"])
+        self.assertIn("decision", retrieve_response["properties"])
 
     def test_http_endpoints_work_through_testclient(self) -> None:
         client = TestClient(create_app())
@@ -155,7 +166,6 @@ class RuntimeTests(unittest.TestCase):
             json={
                 "skill_id": "idapython",
                 "query": "ctree_visitor_t cot_call",
-                "mode": "keyword",
             },
         )
         self.assertEqual(search_response.status_code, 200)
@@ -174,6 +184,38 @@ class RuntimeTests(unittest.TestCase):
         retrieve_body = retrieve_response.json()
         self.assertEqual(retrieve_body["selected_skills"][0]["skill_id"], "idapython")
         self.assertTrue(retrieve_body["decision"]["ready"])
+        self.assertNotIn("debug", retrieve_body)
+
+        public_debug_response = client.post(
+            "/v1/skills/retrieve",
+            json={
+                "query": "@idapython write a script to find xrefs to strcpy",
+                "hinted_skill_ids": ["idapython"],
+                "include_debug": True,
+            },
+        )
+        self.assertEqual(public_debug_response.status_code, 422)
+
+    def test_hidden_console_can_request_debug_output(self) -> None:
+        client = TestClient(create_app())
+
+        html_response = client.get("/console")
+        self.assertEqual(html_response.status_code, 200)
+        self.assertIn("Skill Temple Console", html_response.text)
+
+        debug_response = client.post(
+            "/console/retrieve",
+            json={
+                "query": "@idapython write a script to find xrefs to strcpy",
+                "hinted_skill_ids": ["idapython"],
+                "include_debug": True,
+            },
+        )
+
+        self.assertEqual(debug_response.status_code, 200)
+        body = debug_response.json()
+        self.assertIn("debug", body)
+        self.assertIn("debug", body["selected_skills"][0])
 
     def test_http_expected_errors_are_structured(self) -> None:
         client = TestClient(create_app())

@@ -49,7 +49,7 @@ Debug endpoints remain callable but are hidden from OpenAPI by default so GPT Ac
 
 ## Search behavior
 
-`searchSkillDocs` currently supports only `mode="keyword"`. The keyword engine uses SQLite FTS5 over section-level chunks and boosts exact symbols such as `ida_hexrays.decompile`, `ctree_visitor_t`, `idautils.XrefsTo`, constants, headings, path/module hints, tags, and document priority.
+`searchSkillDocs` uses keyword search only. The keyword engine uses SQLite FTS5 over section-level chunks and boosts exact symbols such as `ida_hexrays.decompile`, `ctree_visitor_t`, `idautils.XrefsTo`, constants, headings, path/module hints, tags, and document priority.
 
 `semantic` and `hybrid` modes are intentionally not exposed until embedding support is added. Skill documentation depends heavily on exact API names, so keyword + symbol matching is the safer default.
 
@@ -113,11 +113,12 @@ debug report. Key fields:
 }
 ```
 
-Set `include_debug=true` only for development, evals, or retrieval tuning. Debug
-mode adds diagnostic fields such as `manifest_summary`, raw `retrieved_docs`,
-`rank_features` inside evidence, `composition_plan`, `used_chars`, and
-`fallback_queries` even when the decision is ready. Without debug mode,
-`fallback_queries` is returned only when `decision.ready=false`.
+The GPT Action schema does not expose `include_debug`. Use the hidden web console
+at `/console` for development, evals, or retrieval tuning. The console can ask
+for debug mode, which adds diagnostic fields such as `manifest_summary`, raw
+`retrieved_docs`, `rank_features` inside evidence, `composition_plan`,
+`used_chars`, and `fallback_queries` even when the decision is ready. Without
+debug mode, `fallback_queries` is returned only when `decision.ready=false`.
 
 The GPT Action request schema for `retrieveSkillContext` is intentionally small:
 
@@ -126,8 +127,7 @@ The GPT Action request schema for `retrieveSkillContext` is intentionally small:
   "query": "@idapython write a script to find xrefs to strcpy",
   "hinted_skill_ids": ["idapython"],
   "max_docs": 6,
-  "allow_skill_chaining": false,
-  "include_debug": false
+  "allow_skill_chaining": false
 }
 ```
 
@@ -175,8 +175,8 @@ Minimal `skill.json`:
   "domains": ["binary_analysis"],
   "conflicts_with": ["ghidra", "binary_ninja"],
   "can_chain_with": ["malware_analysis", "yara"],
-  "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
   "response_contract": {
+    "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
     "must_include": [
       "Provide IDAPython code when the user asks for code.",
       "Mention required imports used by the script.",
@@ -226,6 +226,14 @@ OpenAPI is available at:
 http://127.0.0.1:8765/openapi.json
 ```
 
+The hidden development console is available at:
+
+```text
+http://127.0.0.1:8765/console
+```
+
+It is not included in the GPT Action OpenAPI schema and can request debug output.
+
 For a public Custom GPT Action, the endpoint must be reachable by OpenAI over HTTPS. A local `127.0.0.1` server is useful for development but not directly reachable by the hosted GPT Action runtime.
 
 ## Example requests
@@ -245,7 +253,7 @@ Search docs:
 Invoke-RestMethod http://127.0.0.1:8765/v1/skills/search `
   -Method Post `
   -ContentType 'application/json' `
-  -Body '{"skill_id":"idapython","query":"ctree visitor calls","mode":"keyword"}'
+  -Body '{"skill_id":"idapython","query":"ctree visitor calls"}'
 ```
 
 Read a specific skill file:
