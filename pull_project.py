@@ -26,13 +26,23 @@ def _safe_target_path(destination: Path, relative_path: PurePosixPath) -> Path:
 
 
 def _download_archive(archive_path: Path) -> None:
+    proxy_url = "http://127.0.0.1:7890"
+
+    proxy_handler = urllib.request.ProxyHandler(
+        {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+    )
+    opener = urllib.request.build_opener(proxy_handler)
+
     request = urllib.request.Request(
         ARCHIVE_URL,
         headers={"User-Agent": "skill-temple-project-puller/1.0"},
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with opener.open(request, timeout=60) as response:
             with archive_path.open("wb") as output:
                 shutil.copyfileobj(response, output)
     except HTTPError as exc:
