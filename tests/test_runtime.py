@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -119,6 +121,53 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(SkillPathError):
                     runtime.read("idapython", path)
+
+    def test_runtime_can_load_skills_dir_from_cwd_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            skills_root = tmp_path / "custom_skills"
+            skill_root = skills_root / "demo"
+            docs_root = skill_root / "docs"
+            docs_root.mkdir(parents=True)
+            (skill_root / "skill.json").write_text(
+                json.dumps(
+                    {
+                        "skill_id": "demo",
+                        "name": "demo",
+                        "version": "1",
+                        "description": "Demo skill loaded from cwd .env.",
+                        "aliases": ["@demo"],
+                        "activation": {"trigger_terms": ["dotenv-demo"]},
+                        "entrypoint": "SKILL.md",
+                        "docs": [{"path": "docs/demo.md", "title": "demo"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (skill_root / "SKILL.md").write_text(
+                "# Demo\n\n## Critical Rules\n\n1. Use dotenv configuration.\n",
+                encoding="utf-8",
+            )
+            (docs_root / "demo.md").write_text(
+                "# Demo docs\n\ndotenv-demo content.\n",
+                encoding="utf-8",
+            )
+            (tmp_path / ".env").write_text(
+                f'SKILL_TEMPLE_SKILLS_DIR = "{skills_root}"\n',
+                encoding="utf-8",
+            )
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(tmp_path)
+                with patch.dict(os.environ, {"SKILL_TEMPLE_SKILLS_DIR": ""}, clear=False):
+                    runtime = load_runtime()
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(runtime.skills_dir, skills_root.resolve())
+            result = runtime.retrieve("@demo dotenv-demo")
+            self.assertEqual(result["selected_skills"][0]["skill_id"], "demo")
 
     def test_default_openapi_exposes_only_task_operations(self) -> None:
         app = create_app()

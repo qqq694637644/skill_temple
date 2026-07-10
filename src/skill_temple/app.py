@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import os
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -24,7 +23,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .runtime import SkillNotFoundError, SkillPathError, load_runtime
+from .runtime import (
+    SkillNotFoundError,
+    SkillPathError,
+    env_value_from_environment_or_dotenv,
+    load_runtime,
+)
 
 
 class StrictRequest(BaseModel):
@@ -220,7 +224,7 @@ def _request_server_url(request: Request) -> str:
 def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
     runtime = load_runtime(skills_dir)
     configured_server_url = _normalize_server_url(
-        server_url or os.getenv("SKILL_TEMPLE_SERVER_URL")
+        server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
     )
 
     app = FastAPI(

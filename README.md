@@ -210,6 +210,15 @@ skill-temple --host 127.0.0.1 --port 8765
 
 By default, the gateway serves the packaged example skill. To serve your own skills:
 
+```dotenv
+SKILL_TEMPLE_SKILLS_DIR = "C:\path\to\skills"
+```
+
+The gateway reads a `.env` file from the current working directory automatically.
+Real environment variables and explicit CLI arguments still take precedence.
+
+You can also set the value directly in PowerShell:
+
 ```powershell
 $env:SKILL_TEMPLE_SKILLS_DIR = "C:\path\to\skills"
 skill-temple --host 127.0.0.1 --port 8765
