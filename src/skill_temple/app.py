@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import os
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -24,7 +23,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .runtime import SkillNotFoundError, SkillPathError, load_runtime
+from .runtime import (
+    SkillNotFoundError,
+    SkillPathError,
+    env_value_from_environment_or_dotenv,
+    load_runtime,
+)
 
 
 class StrictRequest(BaseModel):
@@ -220,7 +224,7 @@ def _request_server_url(request: Request) -> str:
 def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
     runtime = load_runtime(skills_dir)
     configured_server_url = _normalize_server_url(
-        server_url or os.getenv("SKILL_TEMPLE_SERVER_URL")
+        server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
     )
 
     app = FastAPI(
@@ -330,11 +334,11 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             "for a user task."
         ),
         description=(
-            "Use this as the default first Action call when a task may require a reusable skill, "
-            "including explicit hints such as @idapython. The endpoint selects relevant skills, "
-            "returns compact manifest rules, retrieves task-relevant documentation snippets, "
-            "and reports whether more search or precise file reading is needed."
+            "Default first Action call for skill-backed tasks, including hints such as "
+            "@idapython. Selects relevant skills, returns compact rules and documentation "
+            "snippets, and reports whether follow-up search or file reads are needed."
         ),
+        openapi_extra={"x-openai-isConsequential": False},
     )
     def retrieve_skill_context(
         request: RetrieveSkillContextRequest,
@@ -355,6 +359,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             "Use after retrieveSkillContext when more specific documentation is needed, "
             "or when the user asks about exact APIs, constants, classes, or edge behavior."
         ),
+        openapi_extra={"x-openai-isConsequential": False},
     )
     def search_skill_docs(request: SearchSkillDocsRequest) -> SearchSkillDocsResponse:
         try:
@@ -386,6 +391,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             "Use for precise follow-up reads when retrieveSkillContext or searchSkillDocs "
             "identifies a specific file path. Paths are constrained to the selected skill root."
         ),
+        openapi_extra={"x-openai-isConsequential": False},
     )
     def read_skill_content(request: ReadSkillContentRequest) -> ReadSkillContentResponse:
         try:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_@*.-]+")
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -31,6 +32,7 @@ _API_SYMBOL_RE = re.compile(
 DEFAULT_MAX_CHARS = 12_000
 DEFAULT_MAX_DOCS = 6
 DEFAULT_MAX_SKILLS = 1
+DOTENV_FILE_NAME = ".env"
 
 
 class SkillRuntimeError(RuntimeError):
@@ -119,7 +121,7 @@ def _resolve_skills_dir(skills_dir: str | Path | None) -> Path:
     if skills_dir:
         return Path(skills_dir).expanduser().resolve()
 
-    env_value = os.environ.get("SKILL_TEMPLE_SKILLS_DIR")
+    env_value = env_value_from_environment_or_dotenv("SKILL_TEMPLE_SKILLS_DIR")
     if env_value:
         return Path(env_value).expanduser().resolve()
 
@@ -129,6 +131,51 @@ def _resolve_skills_dir(skills_dir: str | Path | None) -> Path:
 
     with resources.as_file(resources.files("skill_temple") / "example_skills") as path:
         return path.resolve()
+
+
+def env_value_from_environment_or_dotenv(name: str) -> str | None:
+    """Return an environment value, falling back to the current directory .env file."""
+
+    value = os.environ.get(name)
+    if value:
+        return value
+    return _read_dotenv_file(Path.cwd() / DOTENV_FILE_NAME).get(name)
+
+
+def _read_dotenv_file(path: Path) -> dict[str, str]:
+    if not path.exists() or not path.is_file():
+        return {}
+
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parsed = _parse_dotenv_line(line)
+        if parsed is None:
+            continue
+        key, value = parsed
+        values[key] = value
+    return values
+
+
+def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[7:].lstrip()
+    if "=" not in stripped:
+        return None
+
+    key, raw_value = stripped.split("=", 1)
+    key = key.strip()
+    if not _ENV_KEY_RE.fullmatch(key):
+        return None
+
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return key, value[1:-1]
+
+    value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+    return key, value
 
 
 def _safe_skill_id(skill_id: str) -> str:
