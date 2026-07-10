@@ -82,7 +82,8 @@ def main() -> None:
     print(f"Target directory: {destination}")
 
     with tempfile.TemporaryDirectory(prefix="skill-temple-pull-") as temp_dir:
-        archive_path = Path(temp_dir) / f"{REPO}-{BRANCH}.zip"
+        safe_branch = BRANCH.replace("/", "-")
+        archive_path = Path(temp_dir) / f"{REPO}-{safe_branch}.zip"
         _download_archive(archive_path)
         extracted_files = _extract_archive(archive_path, destination)
 
