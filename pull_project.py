@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 
 OWNER = "qqq694637644"
 REPO = "skill_temple"
-BRANCH = "gpt/fix-action-description-length"
+BRANCH = "main"
 ARCHIVE_URL = f"https://github.com/{OWNER}/{REPO}/archive/refs/heads/{BRANCH}.zip"
 
 

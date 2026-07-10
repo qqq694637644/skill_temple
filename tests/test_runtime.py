@@ -11,205 +11,369 @@ from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
 from skill_temple.evals import evaluate_file
-from skill_temple.runtime import SkillPathError, SkillRuntime, load_runtime
+from skill_temple.runtime import (
+    DEFAULT_MANIFEST_MAX_CHARS,
+    DEFAULT_MAX_SKILLS,
+    RETRIEVE_INSTRUCTIONS_MAX_CHARS,
+    SKILL_CATALOG_MAX_CHARS,
+    SKILL_DESCRIPTION_MAX_CHARS,
+    SKILL_NAME_MAX_CHARS,
+    SkillPathError,
+    SkillRuntime,
+    SkillRuntimeError,
+    load_runtime,
+)
+
+
+def _write_skill(
+    skills_root: Path,
+    skill_id: str,
+    description: str,
+    body: str,
+    docs: dict[str, str] | None = None,
+) -> Path:
+    skill_root = skills_root / skill_id
+    skill_root.mkdir(parents=True, exist_ok=True)
+    (skill_root / "SKILL.md").write_text(
+        "\n".join(
+            [
+                "---",
+                f"name: {skill_id}",
+                f"description: {description}",
+                "---",
+                "",
+                body,
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for relative_path, content in (docs or {}).items():
+        path = skill_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return skill_root
 
 
 class RuntimeTests(unittest.TestCase):
-    def test_packaged_example_runtime_lists_idapython(self) -> None:
+    def test_packaged_example_uses_skill_md_as_the_only_entrypoint(self) -> None:
         runtime = load_runtime()
         result = runtime.list_skills()
 
-        skill_ids = {item["skill_id"] for item in result["skills"]}
-        self.assertIn("idapython", skill_ids)
+        skill = next(item for item in result["skills"] if item["skill_id"] == "idapython")
+        self.assertEqual(skill["entrypoint"], "SKILL.md")
+        self.assertIn("IDAPython", skill["description"])
+        self.assertTrue(skill["content_hash"].startswith("sha256:"))
+        root = Path(runtime.skills_dir) / "idapython"
+        self.assertTrue((root / "SKILL.md").is_file())
+        self.assertFalse((root / "skill.json").exists())
+        self.assertFalse((root / "INDEX.md").exists())
 
-    def test_resolve_uses_alias_and_trigger_terms(self) -> None:
+    def test_resolve_uses_exact_mentions_and_explicit_hints(self) -> None:
         runtime = load_runtime()
+        results = [
+            runtime.resolve("@idapython inspect references"),
+            runtime.resolve("use $idapython for this task"),
+            runtime.resolve("中文任务", hinted_skill_ids=["idapython"]),
+        ]
 
-        result = runtime.resolve("@idapython write a Hex-Rays ctree visitor")
+        for result in results:
+            self.assertEqual(result["matches"][0]["skill_id"], "idapython")
+            self.assertNotIn("confidence", result["matches"][0])
+            self.assertEqual(result["available_skills"][0]["skill_id"], "idapython")
 
-        self.assertTrue(result["matches"])
-        self.assertEqual(result["matches"][0]["skill_id"], "idapython")
-        self.assertGreater(result["matches"][0]["confidence"], 0.5)
-
-    def test_retrieve_returns_compact_decision_packet_by_default(self) -> None:
+    def test_resolve_does_not_make_server_side_semantic_selection(self) -> None:
         runtime = load_runtime()
+        for query in [
+            "please use this tool",
+            "decompile a binary",
+            "反编译 main 函数",
+            "函数求导怎么做",
+            "give me a software patch",
+        ]:
+            with self.subTest(query=query):
+                result = runtime.resolve(query)
+                self.assertEqual(result["matches"], [])
+                self.assertEqual(result["available_skills"][0]["skill_id"], "idapython")
 
-        result = runtime.retrieve(
-            "@idapython write a script to find xrefs to strcpy",
-            hinted_skill_ids=["idapython"],
-        )
+    def test_retrieve_returns_selected_skill_entrypoint_and_references(self) -> None:
+        runtime = load_runtime()
+        result = runtime.retrieve("use $idapython", hinted_skill_ids=["idapython"])
 
-        self.assertTrue(result["selected_skills"])
         selected = result["selected_skills"][0]
         self.assertEqual(selected["skill_id"], "idapython")
-        self.assertIn("reverse_engineering", selected["capability_tags"])
         self.assertEqual(selected["role"], "primary")
-        self.assertTrue(selected["operating_rules"])
-        self.assertTrue(selected["evidence"])
-        self.assertTrue(selected["response_contract"]["expected_output"])
-        self.assertIn("Mention required imports", selected["response_contract"]["must_include"][1])
-        self.assertNotEqual(
-            selected["operating_rules"][:3],
-            selected["response_contract"]["must_include"][:3],
-        )
-        self.assertNotIn("evidence_paths", selected["response_contract"])
-        self.assertTrue(selected["validation_guidance"])
-        self.assertNotIn("manifest_summary", selected)
-        self.assertNotIn("retrieved_docs", selected)
-        self.assertNotIn("rank_features", selected["evidence"][0])
-        self.assertNotIn("debug", result)
-        self.assertTrue(result["decision"]["ready"])
-        self.assertTrue(result["decision"]["stop"])
-        self.assertEqual(result["decision"]["next_action"], "answer")
-        self.assertGreaterEqual(result["retrieval_budget"]["used_docs"], 1)
-        self.assertNotIn("used_chars", result["retrieval_budget"])
-        self.assertNotIn("fallback_queries", result)
+        self.assertEqual(selected["source_path"], "SKILL.md")
+        self.assertIn("name: idapython", selected["instructions"])
+        self.assertIn("docs/idautils.md", selected["referenced_paths"])
+        self.assertIn("docs/ida_hexrays.md", selected["referenced_paths"])
+        self.assertFalse(selected["truncated"])
+        self.assertTrue(result["decision"]["selected"])
+        self.assertEqual(result["decision"]["next_action"], "followSkillInstructions")
+        self.assertEqual(result["available_skills"], [])
+        self.assertFalse(result["catalog_included"])
 
-    def test_retrieve_debug_includes_diagnostics(self) -> None:
+    def test_retrieve_returns_bounded_catalog_before_selection(self) -> None:
         runtime = load_runtime()
+        result = runtime.retrieve("unselected task")
 
-        result = runtime.retrieve(
-            "@idapython write a script to find xrefs to strcpy",
-            hinted_skill_ids=["idapython"],
-            include_debug=True,
-        )
+        self.assertEqual(result["selected_skills"], [])
+        self.assertEqual(result["decision"]["next_action"], "selectSkillOrAnswer")
+        self.assertTrue(result["catalog_included"])
+        self.assertEqual(result["available_skill_count"], 1)
+        self.assertEqual(result["included_skill_count"], 1)
+        self.assertEqual(result["omitted_skill_count"], 0)
 
-        selected = result["selected_skills"][0]
-        self.assertIn("debug", selected)
-        self.assertTrue(selected["debug"]["manifest_summary"]["critical_rules"])
-        self.assertTrue(selected["debug"]["manifest_summary"]["module_router"])
-        self.assertTrue(selected["debug"]["retrieved_docs"])
-        self.assertIn("rank_features", selected["evidence"][0])
-        self.assertIn("debug", result)
-        self.assertIn("used_chars", result["debug"]["retrieval_budget"])
-        self.assertIn("fallback_queries", result["debug"])
+    def test_multiple_explicit_skills_auto_chain_and_preserve_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            for skill_id in ["alpha", "beta"]:
+                _write_skill(root, skill_id, f"Use for {skill_id} tasks.", f"# {skill_id}")
+            runtime = SkillRuntime(root)
 
-    def test_search_returns_relevant_doc_excerpt(self) -> None:
+            mentioned = runtime.retrieve("@alpha $beta do work")
+            hinted = runtime.retrieve("do work", hinted_skill_ids=["alpha", "beta"])
+
+            self.assertEqual(
+                [item["skill_id"] for item in mentioned["selected_skills"]],
+                ["alpha", "beta"],
+            )
+            self.assertEqual(len(hinted["selected_skills"]), 2)
+            self.assertEqual(mentioned["selected_skills"][0]["role"], "primary")
+            self.assertEqual(mentioned["selected_skills"][1]["role"], "secondary")
+
+    def test_more_than_three_explicit_skills_are_not_partially_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            skill_ids = ["alpha", "beta", "gamma", "delta"]
+            for skill_id in skill_ids:
+                _write_skill(root, skill_id, f"Use for {skill_id} tasks.", f"# {skill_id}")
+            runtime = SkillRuntime(root)
+
+            for result in [
+                runtime.retrieve("@alpha @beta @gamma @delta"),
+                runtime.retrieve("work", hinted_skill_ids=skill_ids),
+            ]:
+                self.assertEqual(result["selected_skills"], [])
+                self.assertEqual(result["explicit_skill_ids"], skill_ids)
+                self.assertEqual(
+                    result["omitted_explicit_skill_ids"],
+                    skill_ids[DEFAULT_MAX_SKILLS:],
+                )
+                self.assertEqual(result["decision"]["next_action"], "retryWithFewerSkills")
+
+    def test_unknown_mentions_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            _write_skill(root, "alpha", "Use for alpha tasks.", "# Alpha")
+            runtime = SkillRuntime(root)
+
+            missing = runtime.retrieve("@missing do work")
+            mixed = runtime.retrieve("$alpha @missing do work")
+
+            self.assertEqual(missing["unknown_skill_mentions"], ["missing"])
+            self.assertIn("unavailable", missing["decision"]["reason"].lower())
+            self.assertEqual(mixed["selected_skills"][0]["skill_id"], "alpha")
+            self.assertEqual(mixed["unknown_skill_mentions"], ["missing"])
+
+    def test_multiple_skills_share_global_instruction_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            body = "# Large\n\n" + "\n".join("X" * 200 for _ in range(220))
+            ids = ["alpha", "beta", "gamma"]
+            for skill_id in ids:
+                _write_skill(root, skill_id, f"Use for {skill_id}.", body)
+            runtime = SkillRuntime(root)
+
+            result = runtime.retrieve("work", hinted_skill_ids=ids, include_debug=True)
+            lengths = [len(item["instructions"]) for item in result["selected_skills"]]
+
+            self.assertLessEqual(sum(lengths), RETRIEVE_INSTRUCTIONS_MAX_CHARS)
+            self.assertTrue(all(length <= DEFAULT_MANIFEST_MAX_CHARS for length in lengths))
+            self.assertTrue(all(item["truncated"] for item in result["selected_skills"]))
+            self.assertLess(len(json.dumps(result, ensure_ascii=False)), 100_000)
+
+    def test_catalog_has_independent_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            for index in range(140):
+                skill_id = f"skill{index:03d}"
+                _write_skill(
+                    root,
+                    skill_id,
+                    f"Use {skill_id} for specialized work. " + "D" * 850,
+                    f"# {skill_id}",
+                )
+            runtime = SkillRuntime(root)
+            result = runtime.retrieve("discover")
+            catalog = json.dumps(
+                result["available_skills"], ensure_ascii=False, separators=(",", ":")
+            )
+
+            self.assertLessEqual(len(catalog), SKILL_CATALOG_MAX_CHARS)
+            self.assertEqual(result["available_skill_count"], 140)
+            self.assertEqual(
+                result["included_skill_count"] + result["omitted_skill_count"], 140
+            )
+            self.assertLess(result["included_skill_count"], 140)
+            self.assertTrue(result["descriptions_truncated"])
+            self.assertLess(len(json.dumps(result, ensure_ascii=False)), 100_000)
+
+            client = TestClient(create_app(root))
+            response = client.post("/v1/skills/retrieve", json={"query": "discover"})
+            self.assertEqual(response.status_code, 200)
+            self.assertLess(len(response.text), 100_000)
+
+    def test_entrypoint_hash_is_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            _write_skill(root, "alpha", "Use for alpha tasks.", "# Alpha")
+            runtime = SkillRuntime(root)
+            with patch(
+                "skill_temple.runtime._content_hash",
+                side_effect=AssertionError("entrypoint hash should be cached"),
+            ):
+                catalog = runtime.resolve("discover")
+                selected = runtime.retrieve("$alpha")
+            self.assertTrue(catalog["available_skills"][0]["content_hash"])
+            self.assertEqual(selected["selected_skills"][0]["skill_id"], "alpha")
+
+    def test_search_finds_relevant_reference(self) -> None:
         runtime = load_runtime()
-
         result = runtime.search("idapython", "ctree_visitor_t cot_call", limit=3)
 
         self.assertTrue(result["matches"])
-        self.assertEqual(result["mode"], "keyword")
         self.assertEqual(result["engine"], "sqlite_fts5_symbol_index")
         self.assertEqual(result["matches"][0]["path"], "docs/ida_hexrays.md")
-        self.assertIn("ctree", result["matches"][0]["excerpt"].lower())
         self.assertIn("ctree_visitor_t", result["matches"][0]["symbols"])
-        self.assertIn("rank_features", result["matches"][0])
-        self.assertIn("why_relevant", result["matches"][0])
+        self.assertEqual(result["recommended_next_action"], "readSkillContent")
 
     def test_search_rejects_non_keyword_mode(self) -> None:
         runtime = load_runtime()
-
         with self.assertRaisesRegex(RuntimeError, "Only keyword search mode"):
-            runtime.search("idapython", "ctree visitor", mode="hybrid")
+            runtime.search("idapython", "ctree", mode="hybrid")
 
-    def test_read_file_by_safe_path(self) -> None:
+    def test_read_returns_continuation_and_rejects_unsafe_paths(self) -> None:
         runtime = load_runtime()
+        result = runtime.read("idapython", "SKILL.md", max_lines=5)
 
-        result = runtime.read("idapython", "SKILL.md", start_line=1, max_lines=5)
-
-        self.assertEqual(result["skill_id"], "idapython")
-        self.assertEqual(result["path"], "SKILL.md")
-        self.assertEqual(result["start_line"], 1)
-        self.assertIn("name: idapython", result["content"])
-
-    def test_read_rejects_unsafe_paths(self) -> None:
-        runtime = load_runtime()
-
-        for path in ["../pyproject.toml", "/etc/passwd", "docs/../../SKILL.md"]:
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["next_start_line"], 6)
+        for path in ["../README.md", "/etc/passwd", "docs/../../SKILL.md"]:
             with self.subTest(path=path):
                 with self.assertRaises(SkillPathError):
                     runtime.read("idapython", path)
 
-    def test_runtime_can_load_skills_dir_from_cwd_dotenv(self) -> None:
+    def test_read_does_not_lose_an_oversized_single_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            tmp_path = Path(temp_dir)
-            skills_root = tmp_path / "custom_skills"
-            skill_root = skills_root / "demo"
-            docs_root = skill_root / "docs"
-            docs_root.mkdir(parents=True)
-            (skill_root / "skill.json").write_text(
-                json.dumps(
-                    {
-                        "skill_id": "demo",
-                        "name": "demo",
-                        "version": "1",
-                        "description": "Demo skill loaded from cwd .env.",
-                        "aliases": ["@demo"],
-                        "activation": {"trigger_terms": ["dotenv-demo"]},
-                        "entrypoint": "SKILL.md",
-                        "docs": [{"path": "docs/demo.md", "title": "demo"}],
-                    }
-                ),
-                encoding="utf-8",
+            root = Path(temp_dir) / "skills"
+            long_line = "X" * 100
+            _write_skill(
+                root,
+                "demo",
+                "Use for long-line tests.",
+                "# Demo",
+                {"docs/long.txt": long_line},
             )
-            (skill_root / "SKILL.md").write_text(
-                "# Demo\n\n## Critical Rules\n\n1. Use dotenv configuration.\n",
-                encoding="utf-8",
-            )
-            (docs_root / "demo.md").write_text(
-                "# Demo docs\n\ndotenv-demo content.\n",
-                encoding="utf-8",
-            )
-            (tmp_path / ".env").write_text(
-                f'SKILL_TEMPLE_SKILLS_DIR = "{skills_root}"\n',
-                encoding="utf-8",
-            )
+            runtime = SkillRuntime(root)
+            result = runtime.read("demo", "docs/long.txt", max_chars=10)
+            self.assertEqual(result["content"], long_line)
+            self.assertFalse(result["truncated"])
 
-            previous_cwd = Path.cwd()
+    def test_runtime_loads_skills_from_cwd_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp = Path(temp_dir)
+            root = tmp / "custom_skills"
+            _write_skill(root, "demo", "Use for demo tasks.", "# Demo")
+            (tmp / ".env").write_text(
+                f'SKILL_TEMPLE_SKILLS_DIR = "{root}"\n', encoding="utf-8"
+            )
+            previous = Path.cwd()
             try:
-                os.chdir(tmp_path)
+                os.chdir(tmp)
                 with patch.dict(os.environ, {"SKILL_TEMPLE_SKILLS_DIR": ""}, clear=False):
                     runtime = load_runtime()
             finally:
-                os.chdir(previous_cwd)
+                os.chdir(previous)
+            self.assertEqual(runtime.skills_dir, root.resolve())
+            self.assertEqual(runtime.retrieve("$demo")["selected_skills"][0]["skill_id"], "demo")
 
-            self.assertEqual(runtime.skills_dir, skills_root.resolve())
-            result = runtime.retrieve("@demo dotenv-demo")
-            self.assertEqual(result["selected_skills"][0]["skill_id"], "demo")
+    def test_nested_scan_depth_duplicate_and_frontmatter_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            accepted = root.joinpath(*[f"a{index}" for index in range(5)])
+            rejected = root.joinpath(*[f"b{index}" for index in range(6)])
+            _write_skill(accepted, "accepted", "Use for accepted tasks.", "# Accepted")
+            _write_skill(rejected, "rejected", "Use for rejected tasks.", "# Rejected")
+            runtime = SkillRuntime(root)
+            ids = {item["skill_id"] for item in runtime.list_skills()["skills"]}
+            self.assertIn("accepted", ids)
+            self.assertNotIn("rejected", ids)
 
-    def test_default_openapi_exposes_only_task_operations(self) -> None:
-        app = create_app()
-        schema = app.openapi()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            _write_skill(root / "one", "same", "Use for one.", "# One")
+            _write_skill(root / "two", "same", "Use for two.", "# Two")
+            with self.assertRaisesRegex(SkillRuntimeError, "Duplicate skill name"):
+                SkillRuntime(root)
 
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            _write_skill(
+                root,
+                "n" * (SKILL_NAME_MAX_CHARS + 1),
+                "Use for long names.",
+                "# Long",
+            )
+            with self.assertRaisesRegex(SkillRuntimeError, "name exceeds"):
+                SkillRuntime(root)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            _write_skill(
+                root,
+                "long-description",
+                "D" * (SKILL_DESCRIPTION_MAX_CHARS + 1),
+                "# Long",
+            )
+            with self.assertRaisesRegex(SkillRuntimeError, "description exceeds"):
+                SkillRuntime(root)
+
+    def test_openapi_exposes_only_three_skill_actions(self) -> None:
+        schema = create_app().openapi()
         operation_ids = {
             operation["operationId"]
             for path_item in schema["paths"].values()
             for operation in path_item.values()
         }
-
         self.assertEqual(
             operation_ids,
             {"retrieveSkillContext", "searchSkillDocs", "readSkillContent"},
         )
-        for path, path_item in schema["paths"].items():
-            for method, operation in path_item.items():
-                with self.subTest(path=path, method=method, operation=operation["operationId"]):
-                    self.assertLessEqual(len(operation.get("description", "")), 300)
-                    self.assertIs(operation.get("x-openai-isConsequential"), False)
+        for path_item in schema["paths"].values():
+            for operation in path_item.values():
+                self.assertLessEqual(len(operation.get("description", "")), 300)
+                self.assertIs(operation.get("x-openai-isConsequential"), False)
 
-        retrieve_schema = schema["components"]["schemas"]["RetrieveSkillContextRequest"]
-        retrieve_fields = set(retrieve_schema["properties"])
+        request_schema = schema["components"]["schemas"]["RetrieveSkillContextRequest"]
         self.assertEqual(
-            retrieve_fields,
-            {"query", "hinted_skill_ids", "max_docs", "allow_skill_chaining"},
+            set(request_schema["properties"]),
+            {"query", "hinted_skill_ids", "allow_skill_chaining"},
         )
-        search_schema = schema["components"]["schemas"]["SearchSkillDocsRequest"]
-        self.assertEqual(set(search_schema["properties"]), {"skill_id", "query", "paths", "limit"})
-        read_schema = schema["components"]["schemas"]["ReadSkillContentRequest"]
-        self.assertEqual(
-            set(read_schema["properties"]),
-            {"skill_id", "path", "start_line", "max_lines"},
-        )
+        response = schema["components"]["schemas"]["RetrieveSkillContextResponse"]
+        for field in [
+            "available_skills",
+            "available_skill_count",
+            "omitted_skill_count",
+            "explicit_skill_ids",
+            "unknown_skill_mentions",
+            "omitted_explicit_skill_ids",
+            "decision",
+        ]:
+            self.assertIn(field, response["properties"])
 
-        retrieve_response = schema["components"]["schemas"]["RetrieveSkillContextResponse"]
-        self.assertIn("selected_skills", retrieve_response["properties"])
-        self.assertIn("decision", retrieve_response["properties"])
-
-    def test_openapi_json_infers_server_url_for_gpt_action_imports(self) -> None:
+    def test_server_url_and_optional_bearer_auth(self) -> None:
         client = TestClient(create_app())
-
         response = client.get(
             "/openapi.json",
             headers={
@@ -217,288 +381,76 @@ class RuntimeTests(unittest.TestCase):
                 "x-forwarded-host": "skills.example.com",
             },
         )
+        self.assertEqual(response.json()["servers"], [{"url": "https://skills.example.com"}])
 
-        self.assertEqual(response.status_code, 200)
-        schema = response.json()
-        self.assertEqual(schema["servers"], [{"url": "https://skills.example.com"}])
-        self.assertIn("/v1/skills/retrieve", schema["paths"])
+        with patch.dict(
+            os.environ,
+            {"SKILL_TEMPLE_BEARER_TOKEN": "secret-token"},
+            clear=False,
+        ):
+            protected = TestClient(create_app())
+            unauthorized = protected.post("/v1/skills/retrieve", json={"query": "discover"})
+            authorized = protected.post(
+                "/v1/skills/retrieve",
+                json={"query": "discover"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+            schema = protected.get("/openapi.json").json()
 
-    def test_configured_server_url_is_published_in_openapi_schema(self) -> None:
-        app = create_app(server_url="https://skills.example.com/api/")
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+        self.assertIn("BearerAuth", schema["components"]["securitySchemes"])
 
-        self.assertEqual(app.openapi()["servers"], [{"url": "https://skills.example.com/api"}])
-
-    def test_http_endpoints_work_through_testclient(self) -> None:
+    def test_http_endpoints_console_and_structured_errors(self) -> None:
         client = TestClient(create_app())
 
-        read_response = client.post(
+        discovery = client.post("/v1/skills/retrieve", json={"query": "discover"})
+        selected = client.post(
+            "/v1/skills/retrieve",
+            json={"query": "task", "hinted_skill_ids": ["idapython"]},
+        )
+        read = client.post(
             "/v1/skills/read",
             json={"skill_id": "idapython", "path": "SKILL.md", "max_lines": 5},
         )
-        self.assertEqual(read_response.status_code, 200)
-        self.assertIn("name: idapython", read_response.json()["content"])
-
-        search_response = client.post(
+        search = client.post(
             "/v1/skills/search",
-            json={
-                "skill_id": "idapython",
-                "query": "ctree_visitor_t cot_call",
-            },
+            json={"skill_id": "idapython", "query": "ctree_visitor_t"},
         )
-        self.assertEqual(search_response.status_code, 200)
-        search_body = search_response.json()
-        self.assertEqual(search_body["engine"], "sqlite_fts5_symbol_index")
-        self.assertEqual(search_body["matches"][0]["path"], "docs/ida_hexrays.md")
-
-        retrieve_response = client.post(
-            "/v1/skills/retrieve",
-            json={
-                "query": "@idapython write a script to find xrefs to strcpy",
-                "hinted_skill_ids": ["idapython"],
-            },
-        )
-        self.assertEqual(retrieve_response.status_code, 200)
-        retrieve_body = retrieve_response.json()
-        self.assertEqual(retrieve_body["selected_skills"][0]["skill_id"], "idapython")
-        self.assertTrue(retrieve_body["decision"]["ready"])
-        self.assertNotIn("debug", retrieve_body)
-
-        public_debug_response = client.post(
-            "/v1/skills/retrieve",
-            json={
-                "query": "@idapython write a script to find xrefs to strcpy",
-                "hinted_skill_ids": ["idapython"],
-                "include_debug": True,
-            },
-        )
-        self.assertEqual(public_debug_response.status_code, 422)
-
-    def test_hidden_console_can_request_debug_output(self) -> None:
-        client = TestClient(create_app())
-
-        html_response = client.get("/console")
-        self.assertEqual(html_response.status_code, 200)
-        self.assertIn("Skill Temple Console", html_response.text)
-
-        debug_response = client.post(
+        console = client.get("/console")
+        debug = client.post(
             "/console/retrieve",
             json={
-                "query": "@idapython write a script to find xrefs to strcpy",
+                "query": "$idapython",
                 "hinted_skill_ids": ["idapython"],
                 "include_debug": True,
             },
         )
-
-        self.assertEqual(debug_response.status_code, 200)
-        body = debug_response.json()
-        self.assertIn("debug", body)
-        self.assertIn("debug", body["selected_skills"][0])
-
-    def test_http_expected_errors_are_structured(self) -> None:
-        client = TestClient(create_app())
-
-        response = client.post(
-            "/v1/skills/read",
-            json={"skill_id": "missing", "path": "SKILL.md"},
+        bad_hint = client.post(
+            "/v1/skills/retrieve",
+            json={"query": "task", "hinted_skill_ids": ["missing"]},
         )
-
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["detail"]["error"]["code"], "skill_not_found")
-
-        path_response = client.post(
+        unsafe = client.post(
             "/v1/skills/read",
             json={"skill_id": "idapython", "path": "../README.md"},
         )
 
-        self.assertEqual(path_response.status_code, 404)
-        self.assertEqual(
-            path_response.json()["detail"]["error"]["code"],
-            "unsafe_or_missing_path",
-        )
+        self.assertEqual(discovery.status_code, 200)
+        self.assertEqual(selected.status_code, 200)
+        self.assertEqual(selected.json()["selected_skills"][0]["skill_id"], "idapython")
+        self.assertEqual(read.status_code, 200)
+        self.assertEqual(search.status_code, 200)
+        self.assertIn("Skill Temple Console", console.text)
+        self.assertIn("debug", debug.json())
+        self.assertEqual(bad_hint.status_code, 404)
+        self.assertEqual(bad_hint.json()["detail"]["error"]["code"], "skill_not_found")
+        self.assertEqual(unsafe.status_code, 404)
+        self.assertEqual(unsafe.json()["detail"]["error"]["code"], "unsafe_or_missing_path")
 
-        retrieve_response = client.post(
-            "/v1/skills/retrieve",
-            json={"query": "@missing do something", "hinted_skill_ids": ["missing"]},
-        )
-
-        self.assertEqual(retrieve_response.status_code, 404)
-        self.assertEqual(
-            retrieve_response.json()["detail"]["error"]["code"],
-            "skill_not_found",
-        )
-
-    def test_eval_file_passes_packaged_skill_queries(self) -> None:
+    def test_eval_file_passes(self) -> None:
         report = evaluate_file(Path("evals/skill_queries.jsonl"))
-
         self.assertEqual(report["failed"], 0)
         self.assertGreaterEqual(report["passed"], 2)
-
-    def test_runtime_can_load_external_skill_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tmp_path = Path(temp_dir)
-            skill_root = tmp_path / "skills" / "demo"
-            docs_root = skill_root / "docs"
-            docs_root.mkdir(parents=True)
-            (skill_root / "skill.json").write_text(
-                json.dumps(
-                    {
-                        "skill_id": "demo",
-                        "name": "demo",
-                        "version": "1",
-                        "description": "Demo skill for unittest.",
-                        "aliases": ["@demo"],
-                        "activation": {"trigger_terms": ["unittest-demo"]},
-                        "entrypoint": "SKILL.md",
-                        "docs": [{"path": "docs/demo.md", "title": "demo"}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (skill_root / "SKILL.md").write_text(
-                "# Demo\n\n## Critical Rules\n\n1. Return deterministic examples.\n",
-                encoding="utf-8",
-            )
-            (docs_root / "demo.md").write_text(
-                "# Demo docs\n\nunittest-demo explains local skill loading.\n",
-                encoding="utf-8",
-            )
-
-            runtime = SkillRuntime(tmp_path / "skills")
-            result = runtime.retrieve("@demo unittest-demo task", hinted_skill_ids=["demo"])
-
-            self.assertEqual(result["selected_skills"][0]["skill_id"], "demo")
-            self.assertEqual(
-                result["selected_skills"][0]["evidence"][0]["path"],
-                "docs/demo.md",
-            )
-
-    def test_runtime_can_return_multiple_skills_when_chaining_is_enabled(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tmp_path = Path(temp_dir)
-            skills_root = tmp_path / "skills"
-            for skill_id, trigger in [("alpha", "shared-task"), ("beta", "shared-task")]:
-                skill_root = skills_root / skill_id
-                docs_root = skill_root / "docs"
-                docs_root.mkdir(parents=True)
-                (skill_root / "skill.json").write_text(
-                    json.dumps(
-                        {
-                            "skill_id": skill_id,
-                            "name": skill_id,
-                            "version": "1",
-                            "description": f"{skill_id} skill for shared task.",
-                            "aliases": [f"@{skill_id}"],
-                            "activation": {"trigger_terms": [trigger]},
-                            "entrypoint": "SKILL.md",
-                            "docs": [{"path": "docs/shared.md", "title": "shared"}],
-                            "capability_tags": [skill_id, "shared"],
-                            "can_chain_with": ["beta" if skill_id == "alpha" else "alpha"],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                (skill_root / "SKILL.md").write_text(
-                    f"# {skill_id}\n\n## Critical Rules\n\n1. Use {skill_id}.\n",
-                    encoding="utf-8",
-                )
-                (docs_root / "shared.md").write_text(
-                    f"# Shared\n\n{trigger} content for {skill_id}.\n",
-                    encoding="utf-8",
-                )
-
-            runtime = SkillRuntime(skills_root)
-            single = runtime.retrieve("shared-task")
-            chained = runtime.retrieve(
-                "shared-task",
-                max_skills=2,
-                allow_skill_chaining=True,
-                include_debug=True,
-            )
-
-            self.assertEqual(len(single["selected_skills"]), 1)
-            self.assertEqual(len(chained["selected_skills"]), 2)
-            self.assertEqual(chained["selected_skills"][0]["role"], "primary")
-            self.assertEqual(chained["selected_skills"][1]["role"], "secondary")
-            self.assertTrue(chained["debug"]["composition_plan"]["enabled"])
-
-    def test_skill_chaining_respects_conflicts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tmp_path = Path(temp_dir)
-            skills_root = tmp_path / "skills"
-            for skill_id, conflict in [("alpha", "beta"), ("beta", "alpha")]:
-                skill_root = skills_root / skill_id
-                docs_root = skill_root / "docs"
-                docs_root.mkdir(parents=True)
-                (skill_root / "skill.json").write_text(
-                    json.dumps(
-                        {
-                            "skill_id": skill_id,
-                            "name": skill_id,
-                            "version": "1",
-                            "description": f"{skill_id} skill for shared task.",
-                            "aliases": [f"@{skill_id}"],
-                            "activation": {"trigger_terms": ["shared-task"]},
-                            "entrypoint": "SKILL.md",
-                            "docs": [{"path": "docs/shared.md", "title": "shared"}],
-                            "conflicts_with": [conflict],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                (skill_root / "SKILL.md").write_text(
-                    f"# {skill_id}\n\n## Critical Rules\n\n1. Use {skill_id}.\n",
-                    encoding="utf-8",
-                )
-                (docs_root / "shared.md").write_text(
-                    f"# Shared\n\nshared-task content for {skill_id}.\n",
-                    encoding="utf-8",
-                )
-
-            runtime = SkillRuntime(skills_root)
-            chained = runtime.retrieve("shared-task", max_skills=2, allow_skill_chaining=True)
-
-            self.assertEqual(len(chained["selected_skills"]), 1)
-
-    def test_skill_chaining_respects_can_chain_with_allowlist(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tmp_path = Path(temp_dir)
-            skills_root = tmp_path / "skills"
-            for skill_id in ["alpha", "beta", "gamma"]:
-                skill_root = skills_root / skill_id
-                docs_root = skill_root / "docs"
-                docs_root.mkdir(parents=True)
-                metadata = {
-                    "skill_id": skill_id,
-                    "name": skill_id,
-                    "version": "1",
-                    "description": f"{skill_id} skill for shared task.",
-                    "aliases": [f"@{skill_id}"],
-                    "activation": {"trigger_terms": ["shared-task"]},
-                    "entrypoint": "SKILL.md",
-                    "docs": [{"path": "docs/shared.md", "title": "shared"}],
-                }
-                if skill_id == "alpha":
-                    metadata["can_chain_with"] = ["gamma"]
-                if skill_id == "gamma":
-                    metadata["can_chain_with"] = ["alpha"]
-
-                (skill_root / "skill.json").write_text(json.dumps(metadata), encoding="utf-8")
-                (skill_root / "SKILL.md").write_text(
-                    f"# {skill_id}\n\n## Critical Rules\n\n1. Use {skill_id}.\n",
-                    encoding="utf-8",
-                )
-                (docs_root / "shared.md").write_text(
-                    f"# Shared\n\nshared-task content for {skill_id}.\n",
-                    encoding="utf-8",
-                )
-
-            runtime = SkillRuntime(skills_root)
-            chained = runtime.retrieve("shared-task", max_skills=3, allow_skill_chaining=True)
-
-            self.assertEqual(
-                [skill["skill_id"] for skill in chained["selected_skills"]],
-                ["alpha", "gamma"],
-            )
 
 
 if __name__ == "__main__":
