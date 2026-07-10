@@ -330,10 +330,9 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             "for a user task."
         ),
         description=(
-            "Use this as the default first Action call when a task may require a reusable skill, "
-            "including explicit hints such as @idapython. The endpoint selects relevant skills, "
-            "returns compact manifest rules, retrieves task-relevant documentation snippets, "
-            "and reports whether more search or precise file reading is needed."
+            "Default first Action call for skill-backed tasks, including hints such as "
+            "@idapython. Selects relevant skills, returns compact rules and documentation "
+            "snippets, and reports whether follow-up search or file reads are needed."
         ),
     )
     def retrieve_skill_context(

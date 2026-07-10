@@ -122,10 +122,11 @@ class RuntimeTests(unittest.TestCase):
 
     def test_default_openapi_exposes_only_task_operations(self) -> None:
         app = create_app()
+        schema = app.openapi()
 
         operation_ids = {
             operation["operationId"]
-            for path_item in app.openapi()["paths"].values()
+            for path_item in schema["paths"].values()
             for operation in path_item.values()
         }
 
@@ -133,21 +134,26 @@ class RuntimeTests(unittest.TestCase):
             operation_ids,
             {"retrieveSkillContext", "searchSkillDocs", "readSkillContent"},
         )
-        retrieve_schema = app.openapi()["components"]["schemas"]["RetrieveSkillContextRequest"]
+        for path, path_item in schema["paths"].items():
+            for method, operation in path_item.items():
+                with self.subTest(path=path, method=method, operation=operation["operationId"]):
+                    self.assertLessEqual(len(operation.get("description", "")), 300)
+
+        retrieve_schema = schema["components"]["schemas"]["RetrieveSkillContextRequest"]
         retrieve_fields = set(retrieve_schema["properties"])
         self.assertEqual(
             retrieve_fields,
             {"query", "hinted_skill_ids", "max_docs", "allow_skill_chaining"},
         )
-        search_schema = app.openapi()["components"]["schemas"]["SearchSkillDocsRequest"]
+        search_schema = schema["components"]["schemas"]["SearchSkillDocsRequest"]
         self.assertEqual(set(search_schema["properties"]), {"skill_id", "query", "paths", "limit"})
-        read_schema = app.openapi()["components"]["schemas"]["ReadSkillContentRequest"]
+        read_schema = schema["components"]["schemas"]["ReadSkillContentRequest"]
         self.assertEqual(
             set(read_schema["properties"]),
             {"skill_id", "path", "start_line", "max_lines"},
         )
 
-        retrieve_response = app.openapi()["components"]["schemas"]["RetrieveSkillContextResponse"]
+        retrieve_response = schema["components"]["schemas"]["RetrieveSkillContextResponse"]
         self.assertIn("selected_skills", retrieve_response["properties"])
         self.assertIn("decision", retrieve_response["properties"])
 
