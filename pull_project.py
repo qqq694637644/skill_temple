@@ -12,8 +12,19 @@ from urllib.error import HTTPError, URLError
 
 OWNER = "qqq694637644"
 REPO = "skill_temple"
-BRANCH = "main"
+BRANCH = "gpt/fix-action-description-length"
 ARCHIVE_URL = f"https://github.com/{OWNER}/{REPO}/archive/refs/heads/{BRANCH}.zip"
+
+
+def _safe_archive_file_name(repo: str, branch: str) -> str:
+    safe_branch = "".join(
+        character if character.isalnum() or character in {".", "_", "-"} else "-"
+        for character in branch
+    ).strip(".-_")
+
+    if not safe_branch:
+        safe_branch = "branch"
+    return f"{repo}-{safe_branch}.zip"
 
 
 def _safe_target_path(destination: Path, relative_path: PurePosixPath) -> Path:
@@ -43,6 +54,7 @@ def _download_archive(archive_path: Path) -> None:
 
     try:
         with opener.open(request, timeout=60) as response:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
             with archive_path.open("wb") as output:
                 shutil.copyfileobj(response, output)
     except HTTPError as exc:
@@ -82,8 +94,7 @@ def main() -> None:
     print(f"Target directory: {destination}")
 
     with tempfile.TemporaryDirectory(prefix="skill-temple-pull-") as temp_dir:
-        safe_branch = BRANCH.replace("/", "-")
-        archive_path = Path(temp_dir) / f"{REPO}-{safe_branch}.zip"
+        archive_path = Path(temp_dir) / _safe_archive_file_name(REPO, BRANCH)
         _download_archive(archive_path)
         extracted_files = _extract_archive(archive_path, destination)
 
