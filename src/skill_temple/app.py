@@ -338,6 +338,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             "@idapython. Selects relevant skills, returns compact rules and documentation "
             "snippets, and reports whether follow-up search or file reads are needed."
         ),
+        openapi_extra={"x-openai-isConsequential": False},
     )
     def retrieve_skill_context(
         request: RetrieveSkillContextRequest,
@@ -358,6 +359,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             "Use after retrieveSkillContext when more specific documentation is needed, "
             "or when the user asks about exact APIs, constants, classes, or edge behavior."
         ),
+        openapi_extra={"x-openai-isConsequential": False},
     )
     def search_skill_docs(request: SearchSkillDocsRequest) -> SearchSkillDocsResponse:
         try:
@@ -389,6 +391,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             "Use for precise follow-up reads when retrieveSkillContext or searchSkillDocs "
             "identifies a specific file path. Paths are constrained to the selected skill root."
         ),
+        openapi_extra={"x-openai-isConsequential": False},
     )
     def read_skill_content(request: ReadSkillContentRequest) -> ReadSkillContentResponse:
         try:

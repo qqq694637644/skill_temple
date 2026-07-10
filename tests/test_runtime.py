@@ -187,6 +187,7 @@ class RuntimeTests(unittest.TestCase):
             for method, operation in path_item.items():
                 with self.subTest(path=path, method=method, operation=operation["operationId"]):
                     self.assertLessEqual(len(operation.get("description", "")), 300)
+                    self.assertIs(operation.get("x-openai-isConsequential"), False)
 
         retrieve_schema = schema["components"]["schemas"]["RetrieveSkillContextRequest"]
         retrieve_fields = set(retrieve_schema["properties"])
