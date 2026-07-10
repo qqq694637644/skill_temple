@@ -14,10 +14,13 @@ The web console is also hidden from OpenAPI and may request debug output.
 from __future__ import annotations
 
 import argparse
+import copy
+import os
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -181,8 +184,44 @@ class ReadSkillContentResponse(BaseModel):
     truncated: bool
 
 
-def create_app(skills_dir: str | Path | None = None) -> FastAPI:
+def _normalize_server_url(server_url: str | None) -> str | None:
+    if server_url is None:
+        return None
+
+    normalized = server_url.strip().rstrip("/")
+    if not normalized:
+        return None
+
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("server_url must be an absolute http(s) URL, for example https://example.com")
+    return normalized
+
+
+def _first_header_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    first = value.split(",", 1)[0].strip()
+    return first or None
+
+
+def _request_server_url(request: Request) -> str:
+    forwarded_proto = _first_header_value(request.headers.get("x-forwarded-proto"))
+    forwarded_host = _first_header_value(request.headers.get("x-forwarded-host"))
+    forwarded_prefix = _first_header_value(request.headers.get("x-forwarded-prefix")) or ""
+
+    if forwarded_proto and forwarded_host:
+        forwarded_url = f"{forwarded_proto}://{forwarded_host}{forwarded_prefix}"
+        return _normalize_server_url(forwarded_url) or ""
+
+    return _normalize_server_url(str(request.base_url)) or ""
+
+
+def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
     runtime = load_runtime(skills_dir)
+    configured_server_url = _normalize_server_url(
+        server_url or os.getenv("SKILL_TEMPLE_SERVER_URL")
+    )
 
     app = FastAPI(
         title="Skill Temple Gateway",
@@ -192,6 +231,8 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
             "skill manifest rules and relevant documentation snippets without requiring "
             "Custom GPT Knowledge to unpack or index skill archives."
         ),
+        openapi_url=None,
+        servers=([{"url": configured_server_url}] if configured_server_url else None),
     )
 
     def structured_error(
@@ -219,6 +260,13 @@ def create_app(skills_dir: str | Path | None = None) -> FastAPI:
             allow_skill_chaining=request.allow_skill_chaining,
             include_debug=include_debug,
         )
+
+    @app.get("/openapi.json", include_in_schema=False)
+    def openapi_json(request: Request) -> dict[str, Any]:
+        schema = copy.deepcopy(app.openapi())
+        if "servers" not in schema:
+            schema["servers"] = [{"url": _request_server_url(request)}]
+        return schema
 
     @app.get(
         "/health",
@@ -441,11 +489,23 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--server-url",
+        default=None,
+        help=(
+            "Public absolute http(s) URL to publish in OpenAPI servers. "
+            "Can also be set with SKILL_TEMPLE_SERVER_URL."
+        ),
+    )
     args = parser.parse_args()
 
     import uvicorn
 
-    uvicorn.run(create_app(args.skills_dir), host=args.host, port=args.port)
+    uvicorn.run(
+        create_app(args.skills_dir, server_url=args.server_url),
+        host=args.host,
+        port=args.port,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

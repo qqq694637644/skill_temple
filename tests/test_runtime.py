@@ -151,6 +151,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("selected_skills", retrieve_response["properties"])
         self.assertIn("decision", retrieve_response["properties"])
 
+    def test_openapi_json_infers_server_url_for_gpt_action_imports(self) -> None:
+        client = TestClient(create_app())
+
+        response = client.get(
+            "/openapi.json",
+            headers={
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "skills.example.com",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        schema = response.json()
+        self.assertEqual(schema["servers"], [{"url": "https://skills.example.com"}])
+        self.assertIn("/v1/skills/retrieve", schema["paths"])
+
+    def test_configured_server_url_is_published_in_openapi_schema(self) -> None:
+        app = create_app(server_url="https://skills.example.com/api/")
+
+        self.assertEqual(app.openapi()["servers"], [{"url": "https://skills.example.com/api"}])
+
     def test_http_endpoints_work_through_testclient(self) -> None:
         client = TestClient(create_app())
 

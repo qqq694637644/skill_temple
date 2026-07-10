@@ -239,6 +239,23 @@ public internet endpoint.
 
 For a public Custom GPT Action, the endpoint must be reachable by OpenAI over HTTPS. A local `127.0.0.1` server is useful for development but not directly reachable by the hosted GPT Action runtime.
 
+When importing `/openapi.json` into a GPT Action by URL, the schema must include
+an absolute server URL. Skill Temple adds this automatically from the request URL
+and common reverse-proxy headers (`X-Forwarded-Proto`, `X-Forwarded-Host`, and
+`X-Forwarded-Prefix`). If your deployment cannot forward those headers, set the
+public URL explicitly:
+
+```powershell
+$env:SKILL_TEMPLE_SERVER_URL = "https://your-public-host.example.com"
+skill-temple --host 0.0.0.0 --port 8765
+```
+
+or:
+
+```powershell
+skill-temple --host 0.0.0.0 --port 8765 --server-url https://your-public-host.example.com
+```
+
 ## Example requests
 
 Retrieve context for an explicit skill hint:
