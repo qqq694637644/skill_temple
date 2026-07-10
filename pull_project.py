@@ -26,7 +26,7 @@ def _safe_target_path(destination: Path, relative_path: PurePosixPath) -> Path:
 
 
 def _download_archive(archive_path: Path) -> None:
-    proxy_url = "http://127.0.0.1:7890"
+    proxy_url = "http://127.0.0.1:10810"
 
     proxy_handler = urllib.request.ProxyHandler(
         {
