@@ -1,72 +1,32 @@
 ---
 name: idapython
-description: IDA Pro Python scripting for reverse engineering. Use when writing IDAPython scripts, analyzing binaries, working with IDA APIs for disassembly, decompilation, type systems, cross-references, functions, segments, or database manipulation.
+description: Use for IDAPython scripting, IDA Pro analysis, Hex-Rays decompilation, functions, xrefs, names, types, patches, and IDB automation. 中文：用于 IDA/IDAPython 脚本、Hex-Rays 反编译、伪代码、交叉引用、函数分析、重命名、补丁、类型与 IDB 自动化。
 ---
 
-# IDAPython
+# IDAPython example skill
 
-Use modern `ida_*` modules. Avoid legacy `idc` except for compatibility gaps.
+This packaged Skill demonstrates the GPT Actions progressive-disclosure contract. It is an example only; replace it with the Skills required by your project.
 
-## Module Router
+## Workflow
 
-| Task | Module | Key Items |
-|------|--------|-----------|
-| Bytes/memory | `ida_bytes` | `get_bytes`, `patch_bytes`, `get_flags`, `create_*` |
-| Functions | `ida_funcs` | `func_t`, `get_func`, `add_func`, `get_func_name` |
-| Names | `ida_name` | `set_name`, `get_name`, `demangle_name` |
-| Types | `ida_typeinf` | `tinfo_t`, `apply_tinfo`, `parse_decl` |
-| Decompiler | `ida_hexrays` | `decompile`, `cfunc_t`, `lvar_t`, ctree visitor |
-| Xrefs | `ida_xref` / `idautils` | `XrefsTo`, `XrefsFrom`, `xrefblk_t` |
-| Instructions | `ida_ua` | `insn_t`, `op_t`, `decode_insn` |
-| Iteration | `idautils` | `Functions()`, `Heads()`, `FuncItems()`, `Strings()` |
-| Analysis | `ida_auto` | `auto_wait`, `plan_and_wait` |
+1. Read this `SKILL.md` completely.
+2. Use the task-specific documentation paths below only when they contribute to the current request.
+3. Keep guidance based on documentation separate from facts verified in a live runtime.
+4. Do not invent APIs that are absent from the selected references.
 
-## Core Patterns
+## Documentation routing
 
-### Wait for analysis
+- For function iteration, strings, and cross-reference helpers, read `docs/idautils.md`.
+- For Hex-Rays decompilation, ctree traversal, and local variables, read `docs/ida_hexrays.md`.
 
-```python
-import ida_auto
-ida_auto.auto_wait()
-```
+## Core guidance
 
-### Iterate functions
+- Prefer modern `ida_*` modules and `idautils` over broad legacy `idc` use.
+- Call `ida_auto.auto_wait()` before relying on completed analysis.
+- Assume `ea_t` may contain 64-bit addresses.
+- Handle missing Hex-Rays support and decompilation failure explicitly.
+- Preview mutations and keep them within the user's requested scope.
 
-```python
-import idautils
-import ida_funcs
+## Completion
 
-for ea in idautils.Functions():
-    func = ida_funcs.get_func(ea)
-    name = ida_funcs.get_func_name(ea)
-```
-
-### Cross-references
-
-```python
-import idautils
-
-for xref in idautils.XrefsTo(target_ea):
-    print(f"{xref.frm:#x} -> {xref.to:#x} type={xref.type}")
-```
-
-## Critical Rules
-
-1. **Use modern modules**: prefer `ida_*` modules and `idautils` over legacy `idc`.
-2. **Wait for analysis**: call `ida_auto.auto_wait()` before reading analysis results.
-3. **64-bit addresses**: assume `ea_t` can be 64-bit and print addresses with `{ea:#x}`.
-4. **Prefer names/xrefs over hardcoded addresses** when generating reusable scripts.
-5. **Mutations need review**: preview changes before applying them to a GUI database.
-
-## Anti-Patterns
-
-| Avoid | Do Instead |
-|-------|------------|
-| `idc.*` for everything | Use modern `ida_*` APIs |
-| Hardcoded addresses | Resolve by name, pattern, xref, or function context |
-| Reading before auto-analysis completes | Call `ida_auto.auto_wait()` |
-| Applying mutations blindly | Use dry-run / preview first |
-
-## Detailed API Reference
-
-Read `docs/<module>.md` for focused docs. This example package includes only a small subset; production deployments should replace it with the full skill documentation tree.
+Return the requested guidance or code, identify which references informed it, and state any runtime facts that still require live verification.

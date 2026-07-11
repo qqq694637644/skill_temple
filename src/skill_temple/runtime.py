@@ -1,12 +1,13 @@
-"""Core Skill Runtime retrieval logic.
+"""Codex-style skill discovery and progressive disclosure for GPT Actions.
 
-The core module intentionally has no web-framework dependency. It can be tested
-and embedded independently, while ``skill_temple.app`` exposes it as a FastAPI
-server suitable for GPT Actions.
+A skill is defined by one required ``SKILL.md`` file. Discovery exposes only its
+frontmatter name and description. After selection, its entrypoint is returned within
+the response budget; additional references are read explicitly by safe relative path.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -17,22 +18,36 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+import yaml
+
+_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_@*.-]+")
+_EXPLICIT_SKILL_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[@$]([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?![A-Za-z0-9_-])"
+)
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
+_BACKTICK_PATH_RE = re.compile(
+    r"`((?:docs|references|scripts|assets)/[^`\r\n]+)`"
+)
+_MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 _API_SYMBOL_RE = re.compile(
-    r"\b(?:ida_[A-Za-z0-9_]+|idautils|idaapi|idc)(?:\.[A-Za-z_][A-Za-z0-9_]*)?\b"
+    r"\b(?:[A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b"
     r"|\b[A-Za-z_][A-Za-z0-9_]*(?:_t|_[A-Z0-9]+)\b"
     r"|\b[A-Za-z_][A-Za-z0-9_]*\(\)"
 )
 
-DEFAULT_MAX_CHARS = 12_000
-DEFAULT_MAX_DOCS = 6
-DEFAULT_MAX_SKILLS = 1
+DEFAULT_MAX_SKILLS = 3
+DEFAULT_MANIFEST_MAX_CHARS = 24_000
+RETRIEVE_INSTRUCTIONS_MAX_CHARS = 60_000
+SKILL_CATALOG_MAX_CHARS = 20_000
 DOTENV_FILE_NAME = ".env"
+MAX_SKILL_SCAN_DEPTH = 6
+SKILL_NAME_MAX_CHARS = 64
+SKILL_DESCRIPTION_MAX_CHARS = 1024
+_TEXT_REFERENCE_SUFFIXES = {".md", ".rst", ".txt"}
 
 
 class SkillRuntimeError(RuntimeError):
@@ -49,72 +64,23 @@ class SkillPathError(SkillRuntimeError):
 
 @dataclass(frozen=True)
 class Skill:
-    """Loaded skill metadata and root path."""
+    """A discovered SKILL.md entrypoint."""
 
     skill_id: str
     root: Path
-    metadata: dict[str, Any]
-
-    @property
-    def name(self) -> str:
-        return str(self.metadata.get("name") or self.skill_id)
-
-    @property
-    def description(self) -> str:
-        return str(self.metadata.get("description") or "")
-
-    @property
-    def version(self) -> str:
-        return str(self.metadata.get("version") or "0")
+    name: str
+    description: str
+    content_hash: str
 
     @property
     def entrypoint(self) -> str:
-        return str(self.metadata.get("entrypoint") or "SKILL.md")
-
-    @property
-    def aliases(self) -> list[str]:
-        return [str(item) for item in self.metadata.get("aliases", [])]
-
-    @property
-    def trigger_terms(self) -> list[str]:
-        activation = self.metadata.get("activation") or {}
-        terms = activation.get("trigger_terms") or self.metadata.get("trigger_terms") or []
-        return [str(item) for item in terms]
-
-    @property
-    def policy(self) -> dict[str, Any]:
-        return dict(self.metadata.get("policy") or {})
-
-    @property
-    def retrieval(self) -> dict[str, Any]:
-        return dict(self.metadata.get("retrieval") or {})
-
-    @property
-    def skill_type(self) -> str:
-        return str(self.metadata.get("skill_type") or "tool_doc")
-
-    @property
-    def capability_tags(self) -> list[str]:
-        return [str(item) for item in self.metadata.get("capability_tags", [])]
-
-    @property
-    def domains(self) -> list[str]:
-        return [str(item) for item in self.metadata.get("domains", [])]
-
-    @property
-    def conflicts_with(self) -> list[str]:
-        return [str(item) for item in self.metadata.get("conflicts_with", [])]
-
-    @property
-    def can_chain_with(self) -> list[str]:
-        return [str(item) for item in self.metadata.get("can_chain_with", [])]
+        return "SKILL.md"
 
 
 def load_runtime(skills_dir: str | Path | None = None) -> SkillRuntime:
     """Create a runtime from an explicit path, environment, cwd, or packaged examples."""
 
-    selected = _resolve_skills_dir(skills_dir)
-    return SkillRuntime(selected)
+    return SkillRuntime(_resolve_skills_dir(skills_dir))
 
 
 def _resolve_skills_dir(skills_dir: str | Path | None) -> Path:
@@ -149,10 +115,9 @@ def _read_dotenv_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         parsed = _parse_dotenv_line(line)
-        if parsed is None:
-            continue
-        key, value = parsed
-        values[key] = value
+        if parsed is not None:
+            key, value = parsed
+            values[key] = value
     return values
 
 
@@ -173,7 +138,6 @@ def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
     value = raw_value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return key, value[1:-1]
-
     value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
     return key, value
 
@@ -198,101 +162,46 @@ def _unique_preserve_order(items: list[str]) -> list[str]:
     return result
 
 
-def _read_text(path: Path, max_chars: int | None = None) -> str:
-    text = path.read_text(encoding="utf-8")
-    if max_chars is not None and len(text) > max_chars:
-        return text[:max_chars]
-    return text
-
-
 def _content_hash(path: Path) -> str:
-    import hashlib
-
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    return f"sha256:{digest}"
+    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
 
 
-def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Parse a small YAML-like frontmatter block without external dependencies."""
+def _json_char_count(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
 
-    if not text.startswith("---\n"):
-        return {}, text
-    end = text.find("\n---", 4)
-    if end == -1:
-        return {}, text
-    block = text[4:end].strip()
-    body = text[text.find("\n", end + 1) + 1 :]
-    data: dict[str, str] = {}
-    for line in block.splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        data[key.strip()] = value.strip().strip('"\'')
+
+def _explicit_skill_mentions(query: str) -> list[str]:
+    return _unique_preserve_order(
+        [match.group(1) for match in _EXPLICIT_SKILL_MENTION_RE.finditer(query)]
+    )
+
+
+def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """Parse the YAML frontmatter used by Codex-style ``SKILL.md`` files."""
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise SkillRuntimeError("SKILL.md is missing YAML frontmatter")
+
+    try:
+        closing = next(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        )
+    except StopIteration as exc:
+        raise SkillRuntimeError("SKILL.md frontmatter is not closed with ---") from exc
+
+    parsed = yaml.safe_load("\n".join(lines[1:closing])) or {}
+    if not isinstance(parsed, dict):
+        raise SkillRuntimeError("SKILL.md frontmatter must be a YAML mapping")
+    data = {str(key): value for key, value in parsed.items()}
+    body = "\n".join(lines[closing + 1 :])
     return data, body
 
 
-def _section_lines(markdown: str, heading: str) -> list[str]:
-    wanted = heading.strip().lower()
-    lines = markdown.splitlines()
-    start: int | None = None
-    start_level = 0
-    for index, line in enumerate(lines):
-        match = _HEADING_RE.match(line)
-        if not match:
-            continue
-        level = len(match.group(1))
-        title = match.group(2).strip().lower()
-        if title == wanted:
-            start = index + 1
-            start_level = level
-            break
-    if start is None:
-        return []
-
-    end = len(lines)
-    for index in range(start, len(lines)):
-        match = _HEADING_RE.match(lines[index])
-        if match and len(match.group(1)) <= start_level:
-            end = index
-            break
-    return lines[start:end]
-
-
-def _extract_bullets(lines: list[str], limit: int = 10) -> list[str]:
-    bullets: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith(('-', '*')):
-            bullets.append(stripped[1:].strip())
-        elif re.match(r"^\d+[.)]\s+", stripped):
-            bullets.append(re.sub(r"^\d+[.)]\s+", "", stripped).strip())
-        elif bullets and not stripped.startswith("|"):
-            bullets[-1] = f"{bullets[-1]} {stripped}"
-        if len(bullets) >= limit:
-            break
-    return bullets
-
-
-def _extract_markdown_table(lines: list[str], max_rows: int = 20) -> list[dict[str, str]]:
-    table_lines = [line.strip() for line in lines if line.strip().startswith("|")]
-    if len(table_lines) < 2:
-        return []
-    header = [cell.strip() for cell in table_lines[0].strip("|").split("|")]
-    rows: list[dict[str, str]] = []
-    for line in table_lines[2:]:
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) != len(header):
-            continue
-        rows.append(dict(zip(header, cells, strict=True)))
-        if len(rows) >= max_rows:
-            break
-    return rows
-
-
 class SkillRuntime:
-    """Local registry, search, and retrieval service for reusable skills."""
+    """Discover SKILL.md files and expose progressive disclosure operations."""
 
     def __init__(self, skills_dir: str | Path):
         self.skills_dir = Path(skills_dir).expanduser().resolve()
@@ -308,39 +217,121 @@ class SkillRuntime:
 
     def _load_skills(self) -> dict[str, Skill]:
         skills: dict[str, Skill] = {}
-        for root in sorted(self.skills_dir.iterdir()):
-            if not root.is_dir():
-                continue
-            skill = self._load_skill(root)
+        for manifest_path in self._iter_skill_manifests():
+            skill = self._load_skill(manifest_path)
+            if skill.skill_id in skills:
+                other = skills[skill.skill_id].root
+                raise SkillRuntimeError(
+                    f"Duplicate skill name {skill.skill_id!r}: {other} and {skill.root}"
+                )
             skills[skill.skill_id] = skill
         return skills
 
-    def _load_skill(self, root: Path) -> Skill:
-        metadata_path = root / "skill.json"
-        manifest_path = root / "SKILL.md"
-        metadata: dict[str, Any]
-        if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        elif manifest_path.exists():
-            frontmatter, _body = _parse_frontmatter(manifest_path.read_text(encoding="utf-8"))
-            metadata = dict(frontmatter)
-        else:
-            raise SkillRuntimeError(f"Skill directory lacks skill.json or SKILL.md: {root}")
+    def _iter_skill_manifests(self) -> list[Path]:
+        manifests: list[Path] = []
+        for current_root, dir_names, file_names in os.walk(self.skills_dir, topdown=True):
+            current_path = Path(current_root)
+            depth = len(current_path.relative_to(self.skills_dir).parts)
+            dir_names[:] = sorted(
+                name
+                for name in dir_names
+                if not name.startswith(".") and name != "__pycache__"
+            )
+            if depth >= MAX_SKILL_SCAN_DEPTH:
+                dir_names[:] = []
+            if "SKILL.md" in file_names:
+                manifests.append(current_path / "SKILL.md")
+        return sorted(manifests)
 
-        skill_id = str(metadata.get("skill_id") or metadata.get("name") or root.name)
-        _safe_skill_id(skill_id)
-        metadata.setdefault("skill_id", skill_id)
-        metadata.setdefault("name", skill_id)
-        metadata.setdefault("entrypoint", "SKILL.md")
-        metadata.setdefault("aliases", [f"@{skill_id}", skill_id])
-        return Skill(skill_id=skill_id, root=root.resolve(), metadata=metadata)
+    def _load_skill(self, manifest_path: Path) -> Skill:
+        text = manifest_path.read_text(encoding="utf-8", errors="replace")
+        frontmatter, _body = _parse_frontmatter(text)
+        name = str(frontmatter.get("name") or "").strip()
+        description = str(frontmatter.get("description") or "").strip()
+        if not name:
+            raise SkillRuntimeError(f"SKILL.md is missing frontmatter name: {manifest_path}")
+        if not description:
+            raise SkillRuntimeError(f"SKILL.md is missing frontmatter description: {manifest_path}")
+        if len(name) > SKILL_NAME_MAX_CHARS:
+            raise SkillRuntimeError(
+                f"SKILL.md frontmatter name exceeds {SKILL_NAME_MAX_CHARS} characters: "
+                f"{manifest_path}"
+            )
+        if len(description) > SKILL_DESCRIPTION_MAX_CHARS:
+            raise SkillRuntimeError(
+                "SKILL.md frontmatter description exceeds "
+                f"{SKILL_DESCRIPTION_MAX_CHARS} characters: {manifest_path}"
+            )
+        skill_id = _safe_skill_id(name)
+        return Skill(
+            skill_id=skill_id,
+            root=manifest_path.parent.resolve(),
+            name=name,
+            description=description,
+            content_hash=_content_hash(manifest_path),
+        )
 
     def list_skills(self) -> dict[str, Any]:
-        """Return public metadata for every loaded skill."""
+        """Return discovery metadata only; skill bodies remain undisclosed."""
 
         return {
             "skills_dir": str(self.skills_dir),
             "skills": [self._public_skill_metadata(skill) for skill in self._skills.values()],
+        }
+
+    def _catalog_metadata(self, *, include_catalog: bool) -> dict[str, Any]:
+        total_count = len(self._skills)
+        if not include_catalog:
+            return {
+                "available_skills": [],
+                "available_skill_count": total_count,
+                "included_skill_count": 0,
+                "omitted_skill_count": total_count,
+                "descriptions_truncated": False,
+                "catalog_char_limit": SKILL_CATALOG_MAX_CHARS,
+                "catalog_included": False,
+            }
+
+        available_skills: list[dict[str, Any]] = []
+        descriptions_truncated = False
+        for skill in self._skills.values():
+            metadata = self._public_skill_metadata(skill)
+            if _json_char_count([*available_skills, metadata]) <= SKILL_CATALOG_MAX_CHARS:
+                available_skills.append(metadata)
+                continue
+
+            description = skill.description
+            low = 0
+            high = len(description)
+            best: dict[str, Any] | None = None
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = dict(metadata)
+                candidate["description"] = description[:middle].rstrip() + "..."
+                candidate["description_truncated"] = True
+                if (
+                    _json_char_count([*available_skills, candidate])
+                    <= SKILL_CATALOG_MAX_CHARS
+                ):
+                    best = candidate
+                    low = middle + 1
+                else:
+                    high = middle - 1
+
+            if best is not None:
+                available_skills.append(best)
+                descriptions_truncated = True
+            break
+
+        included_count = len(available_skills)
+        return {
+            "available_skills": available_skills,
+            "available_skill_count": total_count,
+            "included_skill_count": included_count,
+            "omitted_skill_count": total_count - included_count,
+            "descriptions_truncated": descriptions_truncated,
+            "catalog_char_limit": SKILL_CATALOG_MAX_CHARS,
+            "catalog_included": True,
         }
 
     def resolve(
@@ -348,235 +339,197 @@ class SkillRuntime:
         query: str,
         hinted_skill_ids: list[str] | None = None,
         max_results: int = 3,
+        include_catalog: bool = True,
     ) -> dict[str, Any]:
-        """Rank available skills for a user task."""
+        """Resolve only explicit hints or exact ``@/$skill`` mentions.
 
-        hinted_skill_ids = hinted_skill_ids or []
-        query_tokens = set(_tokens(query))
-        query_lower = query.lower()
+        Codex exposes the skill catalog to the model and lets the model decide whether a
+        description clearly matches the task. The runtime does not reproduce that semantic
+        judgment with server-side keyword scoring.
+        """
+
+        hinted_skill_ids = _unique_preserve_order(hinted_skill_ids or [])
+        for skill_id in hinted_skill_ids:
+            self._get_skill(skill_id)
+
+        mentioned_skill_ids = _explicit_skill_mentions(query)
+        known_mentions = [
+            skill_id for skill_id in mentioned_skill_ids if skill_id in self._skills
+        ]
+        unknown_mentions = [
+            skill_id for skill_id in mentioned_skill_ids if skill_id not in self._skills
+        ]
+        selected_ids = _unique_preserve_order([*hinted_skill_ids, *known_mentions])
         matches: list[dict[str, Any]] = []
-
-        for skill in self._skills.values():
-            score = 0.0
-            reasons: list[str] = []
-            if skill.skill_id in hinted_skill_ids:
-                score += 8.0
-                reasons.append("explicit skill hint")
-
-            for alias in skill.aliases:
-                alias_lower = alias.lower()
-                if alias_lower and alias_lower in query_lower:
-                    score += 6.0
-                    reasons.append(f"matched alias {alias!r}")
-
-            for term in skill.trigger_terms:
-                term_lower = term.lower()
-                if term_lower and term_lower in query_lower:
-                    score += 3.0
-                    reasons.append(f"matched trigger term {term!r}")
-
-            metadata_tokens = set(
-                _tokens(" ".join([skill.name, skill.description, *skill.aliases]))
-            )
-            overlap = query_tokens & metadata_tokens
-            if overlap:
-                score += min(5.0, len(overlap) * 0.75)
-                reasons.append("metadata token overlap")
-
-            if score <= 0:
+        for index, skill_id in enumerate(selected_ids):
+            skill = self._skills.get(skill_id)
+            if skill is None:
                 continue
-
-            confidence = min(0.99, score / 12.0)
+            hinted = skill_id in hinted_skill_ids
             matches.append(
                 {
                     "skill_id": skill.skill_id,
                     "name": skill.name,
-                    "confidence": round(confidence, 3),
-                    "score": round(score, 3),
-                    "reason": "; ".join(_unique_preserve_order(reasons)),
+                    "description": skill.description,
+                    "selection_order": index,
+                    "reason": "explicit skill hint" if hinted else "exact @/$ skill mention",
                     "recommended_next_call": "retrieveSkillContext",
                 }
             )
 
-        matches.sort(key=lambda item: item["score"], reverse=True)
-        return {"matches": matches[:max_results]}
-
-    def _validate_hinted_skill_ids(self, hinted_skill_ids: list[str] | None) -> None:
-        for skill_id in hinted_skill_ids or []:
-            self._get_skill(skill_id)
-
-    def _select_chainable_matches(
-        self,
-        matches: list[dict[str, Any]],
-        max_skills: int,
-        allow_skill_chaining: bool,
-    ) -> list[dict[str, Any]]:
-        if not matches or max_skills <= 0:
-            return []
-        if not allow_skill_chaining:
-            return matches[:1]
-
-        selected: list[dict[str, Any]] = []
-        for match in matches:
-            candidate = self._get_skill(match["skill_id"])
-            if selected and not self._can_add_to_chain(candidate, selected):
-                continue
-            selected.append(match)
-            if len(selected) >= max_skills:
-                break
-        return selected
-
-    def _can_add_to_chain(self, candidate: Skill, selected_matches: list[dict[str, Any]]) -> bool:
-        for selected_match in selected_matches:
-            selected_skill = self._get_skill(selected_match["skill_id"])
-            if self._skills_conflict(selected_skill, candidate):
-                return False
-            if not self._skills_can_chain(selected_skill, candidate):
-                return False
-        return True
-
-    def _skills_conflict(self, first: Skill, second: Skill) -> bool:
-        return second.skill_id in first.conflicts_with or first.skill_id in second.conflicts_with
-
-    def _skills_can_chain(self, first: Skill, second: Skill) -> bool:
-        first_allows = not first.can_chain_with or second.skill_id in first.can_chain_with
-        second_allows = not second.can_chain_with or first.skill_id in second.can_chain_with
-        return first_allows and second_allows
+        result = {
+            "matches": matches[:max_results],
+            "explicit_skill_ids": selected_ids,
+            "unknown_skill_mentions": unknown_mentions,
+        }
+        result.update(self._catalog_metadata(include_catalog=include_catalog))
+        return result
 
     def retrieve(
         self,
         query: str,
         hinted_skill_ids: list[str] | None = None,
         max_skills: int = DEFAULT_MAX_SKILLS,
-        max_docs: int = DEFAULT_MAX_DOCS,
-        max_chars: int = DEFAULT_MAX_CHARS,
-        include_manifest: bool = True,
-        include_policy: bool = True,
-        include_recommended_tools: bool = True,
         allow_skill_chaining: bool = False,
         include_debug: bool = False,
     ) -> dict[str, Any]:
-        """Retrieve sufficient skill context for a user task in one call."""
+        """Load explicit skills and return each entrypoint within the response budget."""
 
-        self._validate_hinted_skill_ids(hinted_skill_ids)
-        effective_max_skills = max_skills if allow_skill_chaining else 1
+        effective_max = min(DEFAULT_MAX_SKILLS, max(1, max_skills))
         resolved = self.resolve(
             query,
             hinted_skill_ids=hinted_skill_ids,
-            max_results=max(len(self._skills), effective_max_skills),
+            max_results=max(len(self._skills), effective_max + 1),
+            include_catalog=False,
         )
-        selected_matches = self._select_chainable_matches(
-            resolved["matches"],
-            max_skills=effective_max_skills,
-            allow_skill_chaining=allow_skill_chaining,
-        )
+        explicit_skill_ids = resolved["explicit_skill_ids"]
+        unknown_skill_mentions = resolved["unknown_skill_mentions"]
+        omitted_explicit_skill_ids = explicit_skill_ids[effective_max:]
+        selected_matches = [] if omitted_explicit_skill_ids else resolved["matches"]
         selected: list[dict[str, Any]] = []
-        not_ready_skill_ids: list[str] = []
-        budget_remaining = max_chars
-        used_chars = 0
-        used_docs = 0
-        truncated = False
+        any_truncated = False
+        remaining_instruction_chars = RETRIEVE_INSTRUCTIONS_MAX_CHARS
+        used_instruction_chars = 0
 
         for index, match in enumerate(selected_matches):
             skill = self._get_skill(match["skill_id"])
-            manifest_text = self._read_skill_file(skill, skill.entrypoint, max_chars=6000)
-            manifest_summary = self._manifest_summary(manifest_text) if include_manifest else {}
-            per_doc_budget = max(1000, budget_remaining // max(1, max_docs))
-            search_result = self.search(
-                skill_id=skill.skill_id,
-                query=query,
-                limit=max_docs,
-                max_chars_per_match=per_doc_budget,
-                include_manifest=False,
+            remaining_skill_count = len(selected_matches) - index
+            skill_instruction_budget = min(
+                DEFAULT_MANIFEST_MAX_CHARS,
+                max(1, remaining_instruction_chars // remaining_skill_count),
             )
-
-            docs: list[dict[str, Any]] = []
-            for doc in search_result["matches"]:
-                content_len = len(doc.get("excerpt", ""))
-                if content_len > budget_remaining:
-                    truncated = True
-                    break
-                budget_remaining -= content_len
-                used_chars += content_len
-                used_docs += 1
-                docs.append(doc)
-
-            role = "primary" if index == 0 else "secondary"
-            operating_rules = self._operating_rules(manifest_summary, skill)
-            response_contract = self._response_contract(skill, manifest_summary, docs)
-            answer_readiness = self._answer_readiness(skill, docs, truncated)
-            if not answer_readiness["ready"]:
-                not_ready_skill_ids.append(skill.skill_id)
-            evidence = self._evidence(docs, include_debug=include_debug)
-            selected_packet: dict[str, Any] = {
+            manifest = self.read(
+                skill.skill_id,
+                skill.entrypoint,
+                start_line=1,
+                max_lines=5000,
+                max_chars=skill_instruction_budget,
+            )
+            instruction_chars = len(manifest["content"])
+            remaining_instruction_chars -= instruction_chars
+            used_instruction_chars += instruction_chars
+            any_truncated = any_truncated or manifest["truncated"]
+            packet: dict[str, Any] = {
                 "skill_id": skill.skill_id,
-                "role": role,
-                "confidence": match["confidence"],
-                "capability_tags": skill.capability_tags[:6],
-                "operating_rules": operating_rules,
-                "response_contract": response_contract,
-                "evidence": evidence,
-                "validation_guidance": self._validation_guidance(skill),
+                "name": skill.name,
+                "description": skill.description,
+                "role": "primary" if index == 0 else "secondary",
+                "source_path": skill.entrypoint,
+                "instructions": manifest["content"],
+                "content_hash": manifest["content_hash"],
+                "total_lines": manifest["total_lines"],
+                "truncated": manifest["truncated"],
+                "next_start_line": manifest["next_start_line"],
+                "referenced_paths": self._referenced_paths(skill, manifest["content"]),
             }
             if include_debug:
-                selected_packet["debug"] = {
-                    "name": skill.name,
-                    "version": skill.version,
-                    "skill_type": skill.skill_type,
-                    "domains": skill.domains,
-                    "conflicts_with": skill.conflicts_with,
-                    "can_chain_with": skill.can_chain_with,
+                packet["debug"] = {
                     "why_selected": match["reason"],
-                    "activation": {
-                        "confidence": match["confidence"],
-                        "reason": match["reason"],
-                        "hinted": skill.skill_id in (hinted_skill_ids or []),
-                    },
-                    "manifest_hash": self._hash_if_exists(skill, skill.entrypoint),
-                    "manifest_summary": manifest_summary,
-                    "retrieved_docs": docs,
-                    "answer_readiness": answer_readiness,
-                    "tool_policy": skill.policy if include_policy else {},
-                    "recommended_tools": (
-                        self._recommended_tools(skill) if include_recommended_tools else []
-                    ),
-                    "execution_guidance": self._execution_guidance(skill, manifest_summary, docs),
+                    "selection_order": match["selection_order"],
+                    "skill_root": str(skill.root),
                 }
-            selected.append(selected_packet)
+            selected.append(packet)
 
-        ready = bool(selected) and not truncated and not not_ready_skill_ids
-        stop_reason = self._stop_reason(selected, truncated, not_ready_skill_ids)
-        decision = {
-            "ready": ready,
-            "next_action": "answer" if ready else "searchSkillDocs",
-            "reason": stop_reason,
-            "stop": ready,
-        }
+        if omitted_explicit_skill_ids:
+            decision = {
+                "selected": False,
+                "next_action": "retryWithFewerSkills",
+                "reason": (
+                    f"{len(explicit_skill_ids)} skills were explicitly selected, but at most "
+                    f"{effective_max} can be loaded in one response. Retry with a smaller set."
+                ),
+                "stop_retrieval": False,
+            }
+        elif not selected:
+            if self._skills:
+                if unknown_skill_mentions:
+                    reason = (
+                        "Explicitly mentioned skills are unavailable: "
+                        + ", ".join(unknown_skill_mentions)
+                        + ". Review available_skills, correct the name, or continue without it."
+                    )
+                else:
+                    reason = (
+                        "No explicit skill was selected. Review available_skills; retry once "
+                        "with exact hinted_skill_ids only when a description clearly matches."
+                    )
+                decision = {
+                    "selected": False,
+                    "next_action": "selectSkillOrAnswer",
+                    "reason": reason,
+                    "stop_retrieval": False,
+                }
+            else:
+                decision = {
+                    "selected": False,
+                    "next_action": "answerWithoutSkill",
+                    "reason": "No skills are available.",
+                    "stop_retrieval": True,
+                }
+        elif any_truncated:
+            reason = "A selected SKILL.md was truncated; continue from next_start_line."
+            if unknown_skill_mentions:
+                reason += " Unavailable explicit mentions: " + ", ".join(
+                    unknown_skill_mentions
+                )
+            decision = {
+                "selected": True,
+                "next_action": "readSkillContent",
+                "reason": reason,
+                "stop_retrieval": False,
+            }
+        else:
+            reason = (
+                "Read each returned SKILL.md completely, then read only the references "
+                "it directly identifies for this task."
+            )
+            if unknown_skill_mentions:
+                reason += " Unavailable explicit mentions: " + ", ".join(
+                    unknown_skill_mentions
+                )
+            decision = {
+                "selected": True,
+                "next_action": "followSkillInstructions",
+                "reason": reason,
+                "stop_retrieval": True,
+            }
+
         result: dict[str, Any] = {
             "selected_skills": selected,
-            "retrieval_budget": {
-                "max_docs": max_docs,
-                "max_chars": max_chars,
-                "used_docs": used_docs,
-                "truncated": truncated,
-            },
+            "explicit_skill_ids": explicit_skill_ids,
+            "unknown_skill_mentions": unknown_skill_mentions,
+            "omitted_explicit_skill_ids": omitted_explicit_skill_ids,
             "decision": decision,
         }
-        if not ready:
-            result["fallback_queries"] = self._fallback_queries(query, selected)
+        result.update(self._catalog_metadata(include_catalog=not selected))
         if include_debug:
             result["debug"] = {
-                "composition_plan": self._composition_plan(selected, allow_skill_chaining),
-                "retrieval_budget": {
-                    "max_skills": max_skills,
-                    "effective_max_skills": effective_max_skills,
-                    "max_docs": max_docs,
-                    "max_chars": max_chars,
-                    "used_docs": used_docs,
-                    "used_chars": used_chars,
-                    "truncated": truncated,
-                },
-                "fallback_queries": self._fallback_queries(query, selected),
+                "available_skill_count": len(self._skills),
+                "allow_skill_chaining_requested": allow_skill_chaining,
+                "automatic_skill_chaining": len(selected_matches) > 1,
+                "instruction_char_limit": RETRIEVE_INSTRUCTIONS_MAX_CHARS,
+                "used_instruction_chars": used_instruction_chars,
+                "resolved_matches": resolved["matches"],
             }
         return result
 
@@ -588,14 +541,9 @@ class SkillRuntime:
         limit: int = 5,
         mode: str = "keyword",
         max_chars_per_match: int = 2000,
-        include_manifest: bool = True,
+        include_manifest: bool = False,
     ) -> dict[str, Any]:
-        """Search a skill with SQLite FTS5 plus exact symbol boosting.
-
-        Only ``keyword`` mode is currently implemented. ``semantic`` and ``hybrid``
-        are intentionally not exposed until embeddings are added, because skill
-        docs depend heavily on exact API, class, module, and constant names.
-        """
+        """Find candidate reference paths when SKILL.md does not provide an exact route."""
 
         if mode != "keyword":
             raise SkillRuntimeError("Only keyword search mode is currently supported")
@@ -605,7 +553,9 @@ class SkillRuntime:
         if paths:
             allowed_paths = set()
             for rel_path in paths:
-                self._resolve_path(skill, rel_path)  # validates path safety
+                file_path = self._resolve_path(skill, rel_path)
+                if not file_path.exists() or not file_path.is_file():
+                    raise SkillPathError(f"Skill file not found: {rel_path}")
                 allowed_paths.add(rel_path)
 
         matches = self._search_keyword(
@@ -622,6 +572,7 @@ class SkillRuntime:
             "mode": "keyword",
             "engine": "sqlite_fts5_symbol_index",
             "matches": matches,
+            "recommended_next_action": "readSkillContent" if matches else "none",
         }
 
     def read(
@@ -629,10 +580,10 @@ class SkillRuntime:
         skill_id: str,
         path: str,
         start_line: int = 1,
-        max_lines: int = 200,
-        max_chars: int = 16_000,
+        max_lines: int = 2000,
+        max_chars: int = 32_000,
     ) -> dict[str, Any]:
-        """Read a skill file by safe relative path."""
+        """Read an exact skill-relative path with continuation information."""
 
         skill = self._get_skill(skill_id)
         file_path = self._resolve_path(skill, path)
@@ -641,23 +592,43 @@ class SkillRuntime:
 
         lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
         start = max(1, start_line)
-        end = min(len(lines), start + max_lines - 1)
-        selected = lines[start - 1 : end]
-        content = "\n".join(selected)
-        truncated = False
-        if len(content) > max_chars:
-            content = content[:max_chars]
-            truncated = True
+        if start > max(1, len(lines)):
+            raise SkillPathError(f"start_line exceeds file length: {start_line}")
 
+        selected: list[str] = []
+        end = start - 1
+        char_count = 0
+        max_end = min(len(lines), start + max_lines - 1)
+        for line_number in range(start, max_end + 1):
+            line = lines[line_number - 1]
+            added = len(line) + (1 if selected else 0)
+            if selected and char_count + added > max_chars:
+                break
+            if not selected and len(line) > max_chars:
+                selected.append(line)
+                char_count = len(line)
+                end = line_number
+                break
+            selected.append(line)
+            char_count += added
+            end = line_number
+
+        truncated = end < len(lines)
+        next_start_line = end + 1 if truncated else None
         return {
             "skill_id": skill.skill_id,
             "path": path,
             "start_line": start,
             "end_line": end,
             "total_lines": len(lines),
-            "content": content,
-            "content_hash": _content_hash(file_path),
+            "content": "\n".join(selected),
+            "content_hash": (
+                skill.content_hash
+                if path == skill.entrypoint
+                else _content_hash(file_path)
+            ),
             "truncated": truncated,
+            "next_start_line": next_start_line,
         }
 
     def _get_skill(self, skill_id: str) -> Skill:
@@ -677,47 +648,39 @@ class SkillRuntime:
             raise SkillPathError(f"Unsafe skill path: {path!r}") from exc
         return candidate
 
-    def _read_skill_file(self, skill: Skill, path: str, max_chars: int | None = None) -> str:
-        file_path = self._resolve_path(skill, path)
-        if not file_path.exists() or not file_path.is_file():
-            return ""
-        return _read_text(file_path, max_chars=max_chars)
+    def _referenced_paths(self, skill: Skill, text: str) -> list[str]:
+        candidates = list(_BACKTICK_PATH_RE.findall(text))
+        for target in _MARKDOWN_LINK_RE.findall(text):
+            target = target.split("#", 1)[0].strip()
+            if target and not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", target):
+                candidates.append(target)
 
-    def _candidate_paths(
-        self,
-        skill: Skill,
-        paths: list[str] | None,
-        include_manifest: bool,
-    ) -> list[str]:
-        if paths:
-            return paths
+        result: list[str] = []
+        for candidate in _unique_preserve_order(candidates):
+            if "<" in candidate or ">" in candidate:
+                continue
+            try:
+                path = self._resolve_path(skill, candidate)
+            except SkillPathError:
+                continue
+            if path.exists() and path.is_file():
+                result.append(candidate)
+        return result
 
-        candidates: list[str] = []
-        if include_manifest:
-            candidates.append(skill.entrypoint)
-        index_path = str(skill.metadata.get("index") or "INDEX.md")
-        if (skill.root / index_path).exists():
-            candidates.append(index_path)
-
-        docs = skill.metadata.get("docs") or []
-        for item in docs:
-            if isinstance(item, dict) and item.get("path"):
-                candidates.append(str(item["path"]))
-            elif isinstance(item, str):
-                candidates.append(item)
-
-        docs_dir = skill.root / "docs"
-        if docs_dir.exists():
-            for file_path in sorted(docs_dir.rglob("*.md")):
-                candidates.append(file_path.relative_to(skill.root).as_posix())
-            for file_path in sorted(docs_dir.rglob("*.rst")):
-                candidates.append(file_path.relative_to(skill.root).as_posix())
-
-        return _unique_preserve_order(candidates)
+    def _candidate_paths(self, skill: Skill, include_manifest: bool) -> list[str]:
+        candidates: list[str] = [skill.entrypoint] if include_manifest else []
+        for file_path in sorted(skill.root.rglob("*")):
+            if not file_path.is_file() or file_path.name == skill.entrypoint:
+                continue
+            if file_path.suffix.lower() not in _TEXT_REFERENCE_SUFFIXES:
+                continue
+            relative = file_path.relative_to(skill.root)
+            if any(part.startswith(".") or part == "__pycache__" for part in relative.parts):
+                continue
+            candidates.append(relative.as_posix())
+        return candidates
 
     def _build_search_index(self) -> None:
-        """Build an in-memory FTS5 index for all loaded skills."""
-
         with self._search_lock:
             try:
                 self._search_db.execute(
@@ -729,28 +692,25 @@ class SkillRuntime:
                         heading_path,
                         content,
                         symbols,
-                        tags,
                         start_line UNINDEXED,
                         end_line UNINDEXED,
                         doc_kind UNINDEXED,
                         priority UNINDEXED,
                         content_hash UNINDEXED
                     )
-                    """,
+                    """
                 )
-            except sqlite3.OperationalError as exc:  # pragma: no cover - platform dependent
-                raise SkillRuntimeError(
-                    "SQLite FTS5 support is required for keyword search"
-                ) from exc
+            except sqlite3.OperationalError as exc:  # pragma: no cover
+                raise SkillRuntimeError("SQLite FTS5 support is required") from exc
 
             for skill in self._skills.values():
                 for chunk in self._iter_search_chunks(skill):
                     self._search_db.execute(
                         """
                         INSERT INTO skill_docs_fts(
-                            skill_id, path, title, heading_path, content, symbols, tags,
+                            skill_id, path, title, heading_path, content, symbols,
                             start_line, end_line, doc_kind, priority, content_hash
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             skill.skill_id,
@@ -759,7 +719,6 @@ class SkillRuntime:
                             chunk["heading_path"],
                             chunk["content"],
                             " ".join(chunk["symbols"]),
-                            " ".join(chunk["tags"]),
                             chunk["start_line"],
                             chunk["end_line"],
                             chunk["doc_kind"],
@@ -770,37 +729,14 @@ class SkillRuntime:
             self._search_db.commit()
 
     def _iter_search_chunks(self, skill: Skill) -> list[dict[str, Any]]:
-        doc_metadata = self._doc_metadata(skill)
         chunks: list[dict[str, Any]] = []
-        for rel_path in self._candidate_paths(skill, paths=None, include_manifest=True):
+        for rel_path in self._candidate_paths(skill, include_manifest=True):
             file_path = self._resolve_path(skill, rel_path)
-            if not file_path.exists() or not file_path.is_file():
-                continue
-            metadata = doc_metadata.get(rel_path, {})
             text = file_path.read_text(encoding="utf-8", errors="replace")
-            chunks.extend(self._chunk_file(skill, rel_path, text, metadata))
+            chunks.extend(self._chunk_file(skill, rel_path, text))
         return chunks
 
-    def _doc_metadata(self, skill: Skill) -> dict[str, dict[str, Any]]:
-        result: dict[str, dict[str, Any]] = {}
-        docs = skill.metadata.get("docs") or []
-        for item in docs:
-            if isinstance(item, dict) and item.get("path"):
-                result[str(item["path"])] = item
-            elif isinstance(item, str):
-                result[item] = {"path": item}
-        result.setdefault(skill.entrypoint, {"path": skill.entrypoint, "title": skill.name})
-        index_path = str(skill.metadata.get("index") or "INDEX.md")
-        result.setdefault(index_path, {"path": index_path, "title": "Index"})
-        return result
-
-    def _chunk_file(
-        self,
-        skill: Skill,
-        rel_path: str,
-        text: str,
-        metadata: dict[str, Any],
-    ) -> list[dict[str, Any]]:
+    def _chunk_file(self, skill: Skill, rel_path: str, text: str) -> list[dict[str, Any]]:
         lines = text.splitlines()
         heading_indices = [index for index, line in enumerate(lines) if _HEADING_RE.match(line)]
         if not heading_indices:
@@ -813,57 +749,45 @@ class SkillRuntime:
                 if position + 1 < len(heading_indices)
                 else len(lines)
             )
-            section_lines = lines[start_index:end_index]
-            if not section_lines:
-                continue
-            content = "\n".join(section_lines).strip()
+            content = "\n".join(lines[start_index:end_index]).strip()
             if not content:
                 continue
-            title = self._chunk_title(section_lines, metadata, rel_path)
-            tags = [str(tag) for tag in metadata.get("tags", [])]
-            symbols = self._extract_symbols("\n".join([rel_path, title, " ".join(tags), content]))
+            title = self._chunk_title(lines[start_index:end_index], rel_path)
             chunks.append(
                 {
                     "path": rel_path,
                     "title": title,
                     "heading_path": title,
                     "content": content,
-                    "symbols": symbols,
-                    "tags": tags,
+                    "symbols": self._extract_symbols(f"{rel_path}\n{title}\n{content}"),
                     "start_line": start_index + 1,
                     "end_line": end_index,
                     "doc_kind": self._doc_kind(skill, rel_path),
-                    "priority": self._doc_priority(skill, rel_path, metadata),
+                    "priority": self._doc_priority(skill, rel_path),
                     "content_hash": _content_hash(self._resolve_path(skill, rel_path)),
                 }
             )
         return chunks
 
-    def _chunk_title(self, lines: list[str], metadata: dict[str, Any], rel_path: str) -> str:
+    def _chunk_title(self, lines: list[str], rel_path: str) -> str:
         for line in lines[:5]:
             match = _HEADING_RE.match(line)
             if match:
                 return match.group(2).strip()
-        return str(metadata.get("title") or Path(rel_path).stem)
+        return Path(rel_path).stem
 
     def _doc_kind(self, skill: Skill, rel_path: str) -> str:
         if rel_path == skill.entrypoint:
             return "manifest"
-        if rel_path == str(skill.metadata.get("index") or "INDEX.md"):
-            return "index"
         if rel_path.endswith(".rst"):
             return "full_reference"
-        return "summary_doc"
+        return "reference"
 
-    def _doc_priority(self, skill: Skill, rel_path: str, metadata: dict[str, Any]) -> float:
-        if "priority" in metadata:
-            return float(metadata["priority"])
+    def _doc_priority(self, skill: Skill, rel_path: str) -> float:
         kind = self._doc_kind(skill, rel_path)
         if kind == "manifest":
             return 50.0
-        if kind == "index":
-            return 30.0
-        if kind == "summary_doc":
+        if kind == "reference":
             return 20.0
         return 5.0
 
@@ -874,7 +798,7 @@ class SkillRuntime:
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", match):
                 symbols.append(match)
         symbols.extend(_API_SYMBOL_RE.findall(text))
-        normalized = []
+        normalized: list[str] = []
         for symbol in symbols:
             clean = symbol.strip().strip("`.,:;()")
             if len(clean) >= 3:
@@ -884,14 +808,8 @@ class SkillRuntime:
         return _unique_preserve_order(normalized)
 
     def _fts_query(self, query: str) -> str:
-        terms = []
-        for term in _FTS_TOKEN_RE.findall(query):
-            term = term.lower()
-            if len(term) < 2:
-                continue
-            terms.append(term)
-        terms = _unique_preserve_order(terms)[:16]
-        return " OR ".join(f'"{term}"' for term in terms)
+        terms = [term.lower() for term in _FTS_TOKEN_RE.findall(query) if len(term) >= 2]
+        return " OR ".join(f'"{term}"' for term in _unique_preserve_order(terms)[:16])
 
     def _search_keyword(
         self,
@@ -909,7 +827,7 @@ class SkillRuntime:
         with self._search_lock:
             rows = self._search_db.execute(
                 """
-                SELECT rowid, skill_id, path, title, heading_path, content, symbols, tags,
+                SELECT rowid, skill_id, path, title, heading_path, content, symbols,
                        start_line, end_line, doc_kind, priority, content_hash,
                        bm25(skill_docs_fts) AS bm25_rank
                 FROM skill_docs_fts
@@ -923,57 +841,40 @@ class SkillRuntime:
         query_terms = set(_tokens(query))
         query_symbols = set(self._extract_symbols(query))
         scored: list[dict[str, Any]] = []
-        seen_keys: set[tuple[str, int, int]] = set()
+        seen: set[tuple[str, int, int]] = set()
         for rank_index, row in enumerate(rows):
             rel_path = str(row["path"])
             if allowed_paths is not None and rel_path not in allowed_paths:
                 continue
             if not include_manifest and row["doc_kind"] == "manifest":
                 continue
-
             key = (rel_path, int(row["start_line"]), int(row["end_line"]))
-            if key in seen_keys:
+            if key in seen:
                 continue
-            seen_keys.add(key)
+            seen.add(key)
 
             row_symbols = set(str(row["symbols"] or "").split())
-            row_tags = set(str(row["tags"] or "").split())
             heading_tokens = set(_tokens(str(row["heading_path"] or "")))
             path_tokens = set(_tokens(rel_path))
-            row_priority = float(row["priority"] or 0.0)
-            bm25_rank = float(row["bm25_rank"] or 0.0)
-
             symbol_overlap = query_symbols & row_symbols
             heading_overlap = query_terms & heading_tokens
             path_overlap = query_terms & path_tokens
-            tag_overlap = query_terms & row_tags
-
-            # FTS bm25 values are smaller when better. Rank position is stable and
-            # easier to combine with exact symbol/path/heading boosts.
             fts_rank_score = 50.0 / (rank_index + 1)
-            symbol_score = 100.0 * len(symbol_overlap)
-            path_score = 40.0 * len(path_overlap)
-            heading_score = 30.0 * len(heading_overlap)
-            tag_score = 15.0 * len(tag_overlap)
-            score = fts_rank_score + symbol_score + path_score + heading_score
-            score += tag_score + row_priority
+            score = (
+                fts_rank_score
+                + 100.0 * len(symbol_overlap)
+                + 40.0 * len(path_overlap)
+                + 30.0 * len(heading_overlap)
+                + float(row["priority"] or 0.0)
+            )
             rank_features = {
                 "symbol_matches": sorted(symbol_overlap),
                 "document_symbols": sorted(row_symbols)[:25],
                 "path_matches": sorted(path_overlap),
                 "heading_matches": sorted(heading_overlap),
-                "tag_matches": sorted(tag_overlap),
-                "fts_rank": bm25_rank,
-                "fts_rank_score": round(fts_rank_score, 4),
-                "symbol_score": round(symbol_score, 4),
-                "path_score": round(path_score, 4),
-                "heading_score": round(heading_score, 4),
-                "tag_score": round(tag_score, 4),
-                "doc_priority": row_priority,
+                "fts_rank": float(row["bm25_rank"] or 0.0),
+                "doc_priority": float(row["priority"] or 0.0),
             }
-
-            content = str(row["content"] or "")
-            excerpt = content[:max_chars_per_match]
             scored.append(
                 {
                     "skill_id": skill.skill_id,
@@ -985,7 +886,7 @@ class SkillRuntime:
                     "engine": "sqlite_fts5_symbol_index",
                     "start_line": int(row["start_line"]),
                     "end_line": int(row["end_line"]),
-                    "excerpt": excerpt,
+                    "excerpt": str(row["content"] or "")[:max_chars_per_match],
                     "symbols": sorted(symbol_overlap),
                     "document_symbols": sorted(row_symbols)[:25],
                     "rank_features": rank_features,
@@ -997,210 +898,6 @@ class SkillRuntime:
         scored.sort(key=lambda item: item["score"], reverse=True)
         return scored[:limit]
 
-    def _title_for_path(self, text: str, path: str) -> str:
-        for line in text.splitlines()[:20]:
-            match = _HEADING_RE.match(line)
-            if match:
-                return match.group(2).strip()
-        return Path(path).stem
-
-    def _public_skill_metadata(self, skill: Skill) -> dict[str, Any]:
-        return {
-            "skill_id": skill.skill_id,
-            "name": skill.name,
-            "version": skill.version,
-            "description": skill.description,
-            "aliases": skill.aliases,
-            "trigger_terms": skill.trigger_terms,
-            "skill_type": skill.skill_type,
-            "capability_tags": skill.capability_tags,
-            "domains": skill.domains,
-            "conflicts_with": skill.conflicts_with,
-            "can_chain_with": skill.can_chain_with,
-            "manifest_hash": self._hash_if_exists(skill, skill.entrypoint),
-        }
-
-    def _hash_if_exists(self, skill: Skill, path: str) -> str | None:
-        file_path = self._resolve_path(skill, path)
-        if file_path.exists() and file_path.is_file():
-            return _content_hash(file_path)
-        return None
-
-    def _manifest_summary(self, manifest_text: str) -> dict[str, Any]:
-        frontmatter, body = _parse_frontmatter(manifest_text)
-        critical_rules = _extract_bullets(_section_lines(body, "Critical Rules"))
-        module_router = _extract_markdown_table(_section_lines(body, "Module Router"))
-        anti_patterns = _extract_markdown_table(_section_lines(body, "Anti-Patterns"))
-        first_lines = [line for line in body.splitlines() if line.strip()][:12]
-        return {
-            "frontmatter": frontmatter,
-            "overview": "\n".join(first_lines),
-            "critical_rules": critical_rules,
-            "module_router": module_router,
-            "anti_patterns": anti_patterns,
-        }
-
-    def _recommended_tools(self, skill: Skill) -> list[str]:
-        tools = (
-            skill.metadata.get("required_actions")
-            or skill.metadata.get("recommended_tools")
-            or []
-        )
-        return [str(tool) for tool in tools]
-
-    def _execution_guidance(
-        self,
-        skill: Skill,
-        manifest_summary: dict[str, Any],
-        docs: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        preferred_modules = []
-        for row in manifest_summary.get("module_router", []):
-            module = row.get("Module") or row.get("module")
-            if module:
-                preferred_modules.append(module)
-        return {
-            "answer_strategy": "Use the retrieved manifest rules first, then relevant docs.",
-            "preferred_modules_or_topics": preferred_modules[:10],
-            "retrieved_doc_paths": [doc["path"] for doc in docs],
-            "policy": skill.policy,
-        }
-
-    def _operating_rules(self, manifest_summary: dict[str, Any], skill: Skill) -> list[str]:
-        rules = [str(rule) for rule in manifest_summary.get("critical_rules", [])]
-        if not rules and skill.policy:
-            rules.extend(str(item) for item in skill.policy.get("suggested_checks", []))
-        return rules[:8]
-
-    def _response_contract(
-        self,
-        skill: Skill,
-        manifest_summary: dict[str, Any],
-        docs: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        preferred = []
-        for row in manifest_summary.get("module_router", []):
-            module = row.get("Module") or row.get("module")
-            if module:
-                preferred.append(str(module))
-        contract = dict(skill.metadata.get("response_contract") or {})
-        must_include = [str(item) for item in contract.get("must_include", [])]
-        if not must_include:
-            must_include = self._default_must_include(skill)
-        return {
-            "expected_output": contract.get("expected_output")
-            or skill.metadata.get(
-                "expected_output",
-                "Answer the user task using the selected skill instructions and evidence.",
-            ),
-            "must_include": must_include,
-            "preferred_modules_or_topics": preferred[:8],
-            "must_avoid": [
-                str(item)
-                for item in contract.get("must_avoid", skill.policy.get("must_avoid", []))
-            ],
-        }
-
-    def _default_must_include(self, skill: Skill) -> list[str]:
-        return [
-            "Directly satisfy the user's requested output format.",
-            "Name the relevant APIs, files, or tools used from the evidence.",
-            "Include validation or dry-run guidance when the task can change external state.",
-        ]
-
-    def _answer_readiness(
-        self,
-        skill: Skill,
-        docs: list[dict[str, Any]],
-        truncated: bool,
-    ) -> dict[str, Any]:
-        if truncated:
-            return {
-                "ready": False,
-                "reason": "The retrieval budget was exhausted before all matches were included.",
-                "recommended_next_action": "searchSkillDocs",
-            }
-        if docs:
-            return {
-                "ready": True,
-                "reason": "Manifest rules and relevant documentation snippets are available.",
-                "recommended_next_action": "answer",
-            }
-        return {
-            "ready": False,
-            "reason": f"No relevant documentation snippets were retrieved for {skill.skill_id}.",
-            "recommended_next_action": "searchSkillDocs",
-        }
-
-    def _evidence(
-        self,
-        docs: list[dict[str, Any]],
-        include_debug: bool = False,
-    ) -> list[dict[str, Any]]:
-        evidence: list[dict[str, Any]] = []
-        for doc in docs:
-            item: dict[str, Any] = {
-                "path": doc["path"],
-                "section": doc.get("heading_path") or doc.get("title"),
-                "why_relevant": doc.get("why_relevant", "Matched by keyword search."),
-            }
-            if include_debug:
-                item["score"] = doc.get("score")
-                item["rank_features"] = doc.get("rank_features", {})
-            evidence.append(item)
-        return evidence
-
-    def _stop_reason(
-        self,
-        selected: list[dict[str, Any]],
-        truncated: bool,
-        not_ready_skill_ids: list[str],
-    ) -> str:
-        if truncated:
-            return "Context budget was exhausted."
-        if not selected:
-            return "No skill matched the task."
-        if not_ready_skill_ids:
-            return f"More context is needed for: {', '.join(not_ready_skill_ids)}."
-        return "Selected skill context is sufficient to answer."
-
-    def _fallback_queries(self, query: str, selected: list[dict[str, Any]]) -> list[str]:
-        fallback = [query]
-        for packet in selected:
-            tags = packet.get("capability_tags", [])[:4]
-            docs = packet.get("debug", {}).get("retrieved_docs", [])
-            paths = [doc["path"] for doc in docs[:2]]
-            if tags:
-                fallback.append(" ".join([packet["skill_id"], *tags]))
-            if paths:
-                fallback.append(" ".join([packet["skill_id"], *paths]))
-        return _unique_preserve_order(fallback)[:5]
-
-    def _composition_plan(
-        self,
-        selected: list[dict[str, Any]],
-        allow_skill_chaining: bool,
-    ) -> dict[str, Any]:
-        if not selected:
-            return {
-                "enabled": allow_skill_chaining,
-                "strategy": "No skill selected.",
-                "skills": [],
-            }
-        if len(selected) == 1:
-            return {
-                "enabled": allow_skill_chaining,
-                "strategy": "Use the selected primary skill only.",
-                "skills": [{"skill_id": selected[0]["skill_id"], "role": "primary"}],
-            }
-        return {
-            "enabled": allow_skill_chaining,
-            "strategy": "Use the primary skill first, then secondary skills as supporting context.",
-            "skills": [
-                {"skill_id": item["skill_id"], "role": item["role"]} for item in selected
-            ],
-        }
-
     def _why_relevant(self, rank_features: dict[str, Any]) -> str:
         if rank_features.get("symbol_matches"):
             return "Matched exact API or symbol names."
@@ -1208,14 +905,14 @@ class SkillRuntime:
             return "Matched path or module terms."
         if rank_features.get("heading_matches"):
             return "Matched section heading terms."
-        if rank_features.get("tag_matches"):
-            return "Matched document tags."
         return "Matched full-text keyword search."
 
-    def _validation_guidance(self, skill: Skill) -> dict[str, Any]:
-        policy = skill.policy
+    def _public_skill_metadata(self, skill: Skill) -> dict[str, Any]:
         return {
-            "can_validate": bool(policy.get("can_validate", True)),
-            "suggested_checks": policy.get("suggested_checks", []),
-            "failure_behavior": policy.get("failure_behavior", []),
+            "skill_id": skill.skill_id,
+            "name": skill.name,
+            "description": skill.description,
+            "description_truncated": False,
+            "entrypoint": skill.entrypoint,
+            "content_hash": skill.content_hash,
         }

@@ -1,358 +1,412 @@
 # Skill Temple
 
-Skill Temple is a small **Skill Runtime gateway** for Custom GPT Actions. It gives a GPT a stable way to retrieve reusable skill instructions and documentation without relying on Custom GPT Knowledge to unpack archives or guess which chunks are relevant.
+Skill Temple is a reusable **Codex-style Skill runtime adapted to Custom GPT Actions**.
+It provides a small OpenAPI surface for projects that want filesystem-based `SKILL.md`
+instructions, model-driven Skill selection, and progressive disclosure without copying
+all domain documentation into the Custom GPT Instructions field.
 
-The intended pattern is:
+The runtime was synchronized from the generic Skill layer used by `ida_skill`. It does
+not include IDA Actions or any project-specific backend operations.
+
+## What this template provides
+
+- `SKILL.md` is the only required Skill entrypoint.
+- Discovery uses only frontmatter `name` and `description`.
+- The model chooses Skills; the server does not perform semantic keyword ranking.
+- Codex-style `$skill-name` mentions are supported.
+- `@skill-name` is also supported as a gateway convenience extension.
+- Selected `SKILL.md` files are returned within a shared response budget.
+- Referenced resources are read progressively by safe relative path.
+- Keyword search is available as a fallback inside one selected Skill.
+- Multiple explicit Skills are loaded together up to a maximum of three.
+- The discovery catalog has a separate 20,000-character budget.
+- Optional Bearer authentication is supported for `/v1/*` routes.
+- Only three operations are exposed to GPT Actions.
+
+## Public GPT Actions
+
+| operationId | Method | Path | Purpose |
+| --- | --- | --- | --- |
+| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Return a bounded Skill catalog or load explicitly selected `SKILL.md` files. |
+| `readSkillContent` | `POST` | `/v1/skills/read` | Read an exact safe relative path with continuation metadata. |
+| `searchSkillDocs` | `POST` | `/v1/skills/search` | Search indexed resources inside one selected Skill. |
+
+All three operations publish:
+
+```json
+{"x-openai-isConsequential": false}
+```
+
+Projects can add their own domain Actions beside these three operations.
+
+## Skill directory contract
+
+A Skill requires one entrypoint:
 
 ```text
-Custom GPT Instructions
-  -> call retrieveSkillContext for skill-backed tasks
-  -> call searchSkillDocs or readSkillContent only when more precision is needed
-  -> use the returned decision, operating rules, evidence, response contract,
-     and validation guidance
+skills/
+  example-skill/
+    SKILL.md
+    docs/
+      reference.md
+    scripts/
+      helper.py
+    assets/
+      template.txt
 ```
 
-This repository includes a minimal example `idapython` skill. In production, point `SKILL_TEMPLE_SKILLS_DIR` at your own skills directory.
+`SKILL.md` must begin with YAML frontmatter:
 
-The API is intentionally allowed to make breaking changes during development. It
-does not hide generic runtime failures behind compatibility fallbacks; unexpected
-failures should be visible in tests and during endpoint calls.
+```yaml
+---
+name: example-skill
+description: Use for tasks that require the example domain. 中文：用于示例领域任务。
+---
+```
 
-## Why this exists
+Rules:
 
-Custom GPT Knowledge is useful as a reference source, but it is not a deterministic skill filesystem. For multiple skills, a GPT Action gateway gives you:
+- `name` becomes the stable `skill_id` selection handle.
+- `name` is limited to 64 characters and must match the Skill ID format.
+- `description` is required and limited to 1,024 characters.
+- Use a bilingual description when the GPT serves more than one language.
+- Do not add `skill.json` or `INDEX.md`; the runtime ignores them.
+- Put task routing and behavior in `SKILL.md`.
+- Put detailed reference material in `docs/`, `references/`, `scripts/`, or `assets/`.
+- Point to exact relative paths from `SKILL.md` when the model should read them.
 
-- skill resolution by user task and explicit hints such as `@idapython`
-- compact operating rules and response contracts
-- local documentation search with bounded retrieval budgets
-- precise safe-path file reading
-- version/hash metadata for auditability
-- a small OpenAPI surface that is easier for GPT-5.5 to use reliably
-- a compact GPT-facing decision packet plus optional debug diagnostics
+Example:
 
-## API surface
+```markdown
+---
+name: api-review
+description: Use for reviewing API schemas, compatibility, and versioning risks.
+---
 
-The default GPT Action-facing OpenAPI schema is intentionally small:
+# API review
 
-| Operation | Method | Path | Purpose |
-| --- | --- | --- | --- |
-| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Default first call for tasks that may require a reusable skill. |
-| `searchSkillDocs` | `POST` | `/v1/skills/search` | Targeted follow-up keyword search inside one skill. |
-| `readSkillContent` | `POST` | `/v1/skills/read` | Precise safe-path file read. |
+1. Read this file completely.
+2. For OpenAPI compatibility, read `docs/openapi.md`.
+3. For migration rules, read `docs/versioning.md`.
+4. Return findings, evidence, and unverified risks separately.
+```
 
-Debug endpoints remain callable but are hidden from OpenAPI by default so GPT Actions do not treat them as normal task tools:
+## Selection flow
 
-| Operation | Method | Path | Purpose |
-| --- | --- | --- | --- |
-| `listSkills` | `GET` | `/v1/skills` | Setup/debugging. |
-| `resolveSkill` | `POST` | `/v1/skills/resolve` | Routing diagnostics; `retrieveSkillContext` already resolves internally. |
+Custom GPT Instructions cannot receive a dynamic server catalog before the model turn,
+so this template uses a two-call GPT Actions adaptation.
 
-## Search behavior
+### 1. Discover
 
-`searchSkillDocs` uses keyword search only. The keyword engine uses SQLite FTS5 over section-level chunks and boosts exact symbols such as `ida_hexrays.decompile`, `ctree_visitor_t`, `idautils.XrefsTo`, constants, headings, path/module hints, tags, and document priority.
-
-`semantic` and `hybrid` modes are intentionally not exposed until embedding support is added. Skill documentation depends heavily on exact API names, so keyword + symbol matching is the safer default.
-
-Search results include `rank_features` to explain why a result was selected:
+Call without explicit hints:
 
 ```json
 {
-  "rank_features": {
-    "symbol_matches": ["ctree_visitor_t"],
-    "document_symbols": ["ida_hexrays.decompile", "cot_call"],
-    "path_matches": ["ida_hexrays"],
-    "heading_matches": ["ctree"],
-    "doc_priority": 20.0
-  },
-  "why_relevant": "Matched exact API or symbol names."
-}
-```
-
-## Decision packet
-
-`retrieveSkillContext` defaults to a compact GPT-facing decision packet, not a
-debug report. Key fields:
-
-```json
-{
-  "selected_skills": [
-    {
-      "skill_id": "idapython",
-      "role": "primary",
-      "confidence": 0.99,
-      "capability_tags": ["reverse_engineering", "ida_pro"],
-      "operating_rules": ["Use modern ida_* modules."],
-      "evidence": [
-        {
-          "path": "docs/ida_hexrays.md",
-          "section": "Ctree visitor",
-          "why_relevant": "Matched exact API or symbol names."
-        }
-      ],
-      "response_contract": {
-        "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
-        "must_include": ["Mention required imports used by the script."]
-      },
-      "validation_guidance": {
-        "suggested_checks": ["Confirm the script is read-only unless mutation is requested."]
-      }
-    }
-  ],
-  "retrieval_budget": {
-    "max_docs": 6,
-    "max_chars": 12000,
-    "used_docs": 3,
-    "truncated": false
-  },
-  "decision": {
-    "ready": true,
-    "next_action": "answer",
-    "reason": "Selected skill context is sufficient to answer.",
-    "stop": true
-  }
-}
-```
-
-The GPT Action schema does not expose `include_debug`. Use the hidden web console
-at `/console` only from localhost or a private trusted network for development,
-evals, or retrieval tuning. The console can ask for debug mode, which adds
-diagnostic fields such as `manifest_summary`, raw `retrieved_docs`,
-`rank_features` inside evidence, `composition_plan`, `used_chars`, and
-`fallback_queries` even when the decision is ready. Without debug mode,
-`fallback_queries` is returned only when `decision.ready=false`.
-
-The GPT Action request schema for `retrieveSkillContext` is intentionally small:
-
-```json
-{
-  "query": "@idapython write a script to find xrefs to strcpy",
-  "hinted_skill_ids": ["idapython"],
-  "max_docs": 6,
+  "query": "Review this API migration",
+  "hinted_skill_ids": [],
   "allow_skill_chaining": false
 }
 ```
 
-Other retrieval tuning knobs remain runtime-level API parameters, but are not
-exposed in the default GPT Action request model.
-
-By default, the GPT Action endpoint returns one primary skill. Set
-`allow_skill_chaining=true` to allow up to three chain-compatible supporting
-skills. The lower-level Python runtime API still exposes `max_skills` for
-tuning. Chaining is constrained by metadata:
-
-- `conflicts_with` is enforced symmetrically; conflicting skills are not returned
-  together.
-- `can_chain_with` is treated as an allowlist when present. If a skill declares
-  it, secondary skills must be listed there, and the relationship must not be
-  blocked by the other skill's own allowlist.
-
-## Skill directory layout
-
-Each skill lives in its own directory:
-
-```text
-skills/
-  idapython/
-    skill.json
-    SKILL.md
-    INDEX.md
-    docs/
-      idautils.md
-      ida_hexrays.md
-```
-
-`SKILL.md` is the model-readable behavior document. `skill.json` is the machine-readable routing, retrieval, and policy metadata.
-
-Minimal `skill.json`:
+The response contains a bounded `available_skills` catalog:
 
 ```json
 {
-  "skill_id": "idapython",
-  "name": "idapython",
-  "version": "2026.06.02",
-  "description": "IDA Pro Python scripting for reverse engineering.",
-  "skill_type": "tool_doc",
-  "capability_tags": ["reverse_engineering", "python_scripting", "ida_pro"],
-  "domains": ["binary_analysis"],
-  "conflicts_with": ["ghidra", "binary_ninja"],
-  "can_chain_with": ["malware_analysis", "yara"],
-  "response_contract": {
-    "expected_output": "IDAPython code or analysis guidance grounded in the selected docs.",
-    "must_include": [
-      "Provide IDAPython code when the user asks for code.",
-      "Mention required imports used by the script.",
-      "Mention validation or dry-run steps when the task can mutate an IDB."
-    ]
-  },
-  "aliases": ["@idapython", "idapython", "IDA", "Hex-Rays"],
-  "entrypoint": "SKILL.md",
-  "index": "INDEX.md",
-  "activation": {
-    "trigger_terms": ["ida_*", "idautils", "ida_hexrays", "decompile", "xrefs"]
-  },
-  "docs": [
-    {"path": "docs/idautils.md", "title": "idautils", "tags": ["iteration", "xrefs"]}
+  "selected_skills": [],
+  "available_skills": [
+    {
+      "skill_id": "api-review",
+      "name": "api-review",
+      "description": "Use for reviewing API schemas...",
+      "description_truncated": false,
+      "entrypoint": "SKILL.md",
+      "content_hash": "sha256:..."
+    }
   ],
-  "policy": {
-    "prefer_structured_reads_first": true,
-    "mutations_require_confirmation": true,
-    "dry_run_first": true
+  "available_skill_count": 1,
+  "included_skill_count": 1,
+  "omitted_skill_count": 0,
+  "descriptions_truncated": false,
+  "catalog_char_limit": 20000,
+  "catalog_included": true,
+  "decision": {
+    "selected": false,
+    "next_action": "selectSkillOrAnswer",
+    "stop_retrieval": false
   }
 }
 ```
 
-## Run locally
+The model reviews the visible `name` and `description`. The server does not score the
+query against descriptions.
+
+When `omitted_skill_count > 0` or `descriptions_truncated=true`, the visible catalog is
+not the complete installed set.
+
+### 2. Load an exact Skill
+
+When one description clearly applies, retry once with the exact selection handle:
+
+```json
+{
+  "query": "Review this API migration",
+  "hinted_skill_ids": ["api-review"],
+  "allow_skill_chaining": false
+}
+```
+
+A selected packet contains:
+
+```json
+{
+  "skill_id": "api-review",
+  "name": "api-review",
+  "description": "Use for reviewing API schemas...",
+  "role": "primary",
+  "source_path": "SKILL.md",
+  "instructions": "---\nname: api-review\n...",
+  "content_hash": "sha256:...",
+  "total_lines": 42,
+  "truncated": false,
+  "next_start_line": null,
+  "referenced_paths": ["docs/openapi.md", "docs/versioning.md"]
+}
+```
+
+Selected responses omit the repeated catalog:
+
+```json
+{
+  "available_skills": [],
+  "catalog_included": false
+}
+```
+
+## Explicit mentions
+
+Codex-style mention:
+
+```text
+$api-review
+```
+
+Gateway extension:
+
+```text
+@api-review
+```
+
+Unknown textual mentions are returned in:
+
+```json
+{"unknown_skill_mentions": ["missing-skill"]}
+```
+
+Unknown `hinted_skill_ids` return the existing structured HTTP 404 because hints are
+strict selection handles supplied by the caller.
+
+## Multiple Skills
+
+Two or three exact hints or mentions load automatically together. The caller does not
+need to set `allow_skill_chaining=true`; that field remains only for backward
+compatibility.
+
+```json
+{
+  "query": "Use $api-review and $release-notes",
+  "hinted_skill_ids": []
+}
+```
+
+Packets receive `primary` and `secondary` roles in explicit selection order.
+
+More than three explicit selections are never partially executed. The runtime returns:
+
+```json
+{
+  "selected_skills": [],
+  "explicit_skill_ids": ["one", "two", "three", "four"],
+  "omitted_explicit_skill_ids": ["four"],
+  "decision": {
+    "selected": false,
+    "next_action": "retryWithFewerSkills"
+  }
+}
+```
+
+## Response budgets
+
+- Catalog budget: 20,000 serialized JSON characters.
+- Single `SKILL.md` budget: 24,000 characters.
+- Combined selected instructions budget: 60,000 characters.
+- Maximum selected Skills per call: 3.
+
+When a selected entrypoint is truncated, the packet returns `next_start_line`. Continue
+with `readSkillContent`; do not call `retrieveSkillContext` again just to continue the
+same file.
+
+## Reading referenced resources
+
+```json
+{
+  "skill_id": "api-review",
+  "path": "docs/openapi.md",
+  "start_line": 1,
+  "max_lines": 300
+}
+```
+
+The response includes:
+
+```text
+start_line
+end_line
+total_lines
+content
+content_hash
+truncated
+next_start_line
+```
+
+Paths are constrained to the selected Skill root. Absolute paths and traversal such as
+`../README.md` are rejected.
+
+A single line longer than the normal character budget is returned intact rather than
+silently losing the remainder of that line.
+
+## Search fallback
+
+Use `searchSkillDocs` only when the selected `SKILL.md` does not identify an exact
+resource path:
+
+```json
+{
+  "skill_id": "api-review",
+  "query": "breaking change schema compatibility",
+  "paths": null,
+  "limit": 5
+}
+```
+
+Search uses SQLite FTS5 over section-level chunks and boosts exact symbols, path terms,
+and headings. Search is scoped to one explicit `skill_id`.
+
+## Configuration
+
+Copy `.env.example` to `.env`:
+
+```dotenv
+SKILL_TEMPLE_SERVER_URL=https://skills.example.com
+SKILL_TEMPLE_SKILLS_DIR=C:/path/to/project/skills
+SKILL_TEMPLE_BEARER_TOKEN=replace-with-a-long-random-secret
+```
+
+`SKILL_TEMPLE_SKILLS_DIR` lookup order:
+
+1. explicit `create_app(skills_dir=...)` or `SkillRuntime(path)` argument;
+2. environment variable;
+3. `.env` in the current working directory;
+4. local `./skills` directory;
+5. packaged example Skills.
+
+When `SKILL_TEMPLE_BEARER_TOKEN` is set, `/v1/*` and `/console/retrieve` require:
+
+```text
+Authorization: Bearer <token>
+```
+
+`/openapi.json`, `/health`, and `/console` remain public so the schema can be imported
+and the debug console can load.
+
+## Install and run
 
 ```powershell
 py -3 -m pip install -e .[dev]
 skill-temple --host 127.0.0.1 --port 8765
 ```
 
-By default, the gateway serves the packaged example skill. To serve your own skills:
-
-```dotenv
-SKILL_TEMPLE_SKILLS_DIR = "C:\path\to\skills"
-```
-
-The gateway reads a `.env` file from the current working directory automatically.
-Real environment variables and explicit CLI arguments still take precedence.
-
-You can also set the value directly in PowerShell:
+With a custom Skill directory:
 
 ```powershell
-$env:SKILL_TEMPLE_SKILLS_DIR = "C:\path\to\skills"
-skill-temple --host 127.0.0.1 --port 8765
+skill-temple --skills-dir C:/path/to/project/skills --host 127.0.0.1 --port 8765
 ```
 
-or:
-
-```powershell
-skill-temple --skills-dir C:\path\to\skills --host 127.0.0.1 --port 8765
-```
-
-OpenAPI is available at:
+OpenAPI:
 
 ```text
 http://127.0.0.1:8765/openapi.json
 ```
 
-The hidden development console is available at:
+Health:
+
+```text
+http://127.0.0.1:8765/health
+```
+
+Debug console:
 
 ```text
 http://127.0.0.1:8765/console
 ```
 
-It is not included in the GPT Action OpenAPI schema and can request debug output.
-Use it only on localhost or behind private access controls; do not expose it as a
-public internet endpoint.
+## Add project-specific Actions
 
-For a public Custom GPT Action, the endpoint must be reachable by OpenAI over HTTPS. A local `127.0.0.1` server is useful for development but not directly reachable by the hosted GPT Action runtime.
+Keep the Skill runtime generic and register project-specific Actions in a separate
+module:
 
-When importing `/openapi.json` into a GPT Action by URL, the schema must include
-an absolute server URL. Skill Temple adds this automatically from the request URL
-and common reverse-proxy headers (`X-Forwarded-Proto`, `X-Forwarded-Host`, and
-`X-Forwarded-Prefix`). If your deployment cannot forward those headers, set the
-public URL explicitly:
+```python
+from fastapi import FastAPI
 
-```powershell
-$env:SKILL_TEMPLE_SERVER_URL = "https://your-public-host.example.com"
-skill-temple --host 0.0.0.0 --port 8765
+
+def register_project_actions(app: FastAPI) -> None:
+    @app.post(
+        "/v1/project/read",
+        operation_id="readProjectData",
+        openapi_extra={"x-openai-isConsequential": False},
+    )
+    def read_project_data(request: ProjectRequest) -> dict[str, object]:
+        return {"result": "..."}
 ```
 
-or:
+Then call `register_project_actions(app)` near the end of `create_app()`.
+
+Do not put project-specific tool rules into the global Skill runtime. Put domain behavior
+inside the selected `SKILL.md` and keep operationId names aligned with the project's
+OpenAPI schema.
+
+## Validation
 
 ```powershell
-skill-temple --host 0.0.0.0 --port 8765 --server-url https://your-public-host.example.com
+py -3 -m ruff check .
+py -3 -m pytest
+py -3 -m skill_temple.evals evals/skill_queries.jsonl
 ```
 
-## Example requests
+The test suite covers:
 
-Retrieve context for an explicit skill hint:
+- `SKILL.md`-only discovery;
+- exact hints and `$skill` / `@skill` mentions;
+- no server-side semantic routing;
+- bounded catalog and instruction responses;
+- multi-Skill explicit selection;
+- unknown mentions;
+- continuation and path safety;
+- OpenAPI operation/schema stability;
+- optional Bearer authentication;
+- deterministic search/eval behavior.
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/v1/skills/retrieve `
-  -Method Post `
-  -ContentType 'application/json' `
-  -Body '{"query":"@idapython write a script to find xrefs to strcpy","hinted_skill_ids":["idapython"]}'
-```
+## Packaged example
 
-Search docs:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/v1/skills/search `
-  -Method Post `
-  -ContentType 'application/json' `
-  -Body '{"skill_id":"idapython","query":"ctree visitor calls"}'
-```
-
-Read a specific skill file:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/v1/skills/read `
-  -Method Post `
-  -ContentType 'application/json' `
-  -Body '{"skill_id":"idapython","path":"SKILL.md","start_line":1,"max_lines":80}'
-```
-
-## Suggested GPT Instructions
+The repository includes an `idapython` Skill only as a realistic progressive-disclosure
+example:
 
 ```text
-When a user task appears to require a reusable skill, use retrieveSkillContext
-with the user's task and any explicit skill hint, such as @idapython.
-
-Use the returned operating_rules, evidence, response_contract, and
-validation_guidance as the behavioral source of truth.
-Call searchSkillDocs or readSkillContent only when the retrieved context is
-insufficient for the user's concrete request.
-
-Prefer answering with the minimum sufficient skill context.
-Stop retrieving once you can satisfy the user's core request with accurate,
-task-relevant evidence.
-
-For IDA/IDAPython tasks:
-- Prefer structured read-only tools before custom execution.
-- Use execute_idapython only when structured tools are insufficient.
-- Never apply mutations without explicit user confirmation and dry-run review.
+src/skill_temple/example_skills/idapython/
+  SKILL.md
+  docs/
+    idautils.md
+    ida_hexrays.md
 ```
 
-## Retrieval evals
-
-Skill Temple includes a tiny deterministic eval runner for retrieval quality:
-
-```powershell
-skill-temple-eval evals/skill_queries.jsonl
-```
-
-Each JSONL case can assert expected skill, retrieved docs, and surfaced symbols:
-
-```json
-{"query":"@idapython walk ctree calls","expected_skill":"idapython","expected_paths":["docs/ida_hexrays.md"],"expected_symbols":["ctree_visitor_t"]}
-```
-
-The eval runner exits non-zero on failures so it can be used in CI later.
-
-## Error behavior
-
-Known input errors return structured details. This includes explicit missing
-skill IDs in `searchSkillDocs`, `readSkillContent`, and `retrieveSkillContext`
-`hinted_skill_ids`, plus unsafe or missing paths in read/search path filters.
-Unexpected runtime failures are not wrapped because this project is still in
-active development.
-
-```json
-{
-  "detail": {
-    "error": {
-      "code": "skill_not_found",
-      "message": "Skill not found: missing",
-      "suggested_next_action": "check_skill_id"
-    }
-  }
-}
-```
-
-## Tests
-
-```powershell
-py -3 -m pytest
-```
+It does not add IDA Actions to this template. Replace it with the Skills for your own
+project or point `SKILL_TEMPLE_SKILLS_DIR` at another directory.

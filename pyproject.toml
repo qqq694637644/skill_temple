@@ -1,7 +1,7 @@
 [project]
 name = "skill-temple"
-version = "0.1.0"
-description = "A small Skill Runtime gateway for Custom GPT Actions"
+version = "0.2.0"
+description = "Codex-style model-driven Skills adapted to Custom GPT Actions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -12,6 +12,7 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "pydantic>=2.0.0",
+    "PyYAML>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -38,7 +39,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 skill_temple = [
-    "example_skills/*/*.json",
     "example_skills/*/*.md",
     "example_skills/*/docs/*.md",
 ]
