@@ -1,0 +1,2 @@
+{"id":"idapython-xrefs","query":"load idapython and find the XrefsTo reference","expected_skill":"idapython","expected_paths":["docs/idautils.md"],"expected_symbols":["XrefsTo"]}
+{"id":"idapython-ctree","query":"load idapython and find ctree_visitor_t and cot_call","expected_skill":"idapython","expected_paths":["docs/ida_hexrays.md"],"expected_symbols":["ctree_visitor_t","cot_call"]}

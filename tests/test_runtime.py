@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -9,6 +10,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
+from skill_temple.evals import evaluate_file
+from skill_temple.openapi_builder import build_openapi
 from skill_temple.prompt_builder import build_instructions, render_catalog
 from skill_temple.runtime import (
     SkillNotFoundError,
@@ -254,6 +257,68 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(missing.json()["detail"]["error"]["code"], "skill_not_found")
         self.assertEqual(unsafe.status_code, 404)
         self.assertEqual(unsafe.json()["detail"]["error"]["code"], "unsafe_or_missing_path")
+
+    def test_optional_bearer_auth_and_debug_console(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"SKILL_TEMPLE_BEARER_TOKEN": "secret-token"},
+            clear=False,
+        ):
+            client = TestClient(create_app())
+            console = client.get("/console")
+            unauthorized = client.post(
+                "/v1/skills/load", json={"skill_ids": ["idapython"]}
+            )
+            console_unauthorized = client.post(
+                "/console/load", json={"skill_ids": ["idapython"]}
+            )
+            authorized = client.post(
+                "/v1/skills/load",
+                json={"skill_ids": ["idapython"]},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+            console_authorized = client.post(
+                "/console/read",
+                json={"skill_id": "idapython", "path": "SKILL.md"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+            schema = client.get("/openapi.json").json()
+
+        self.assertEqual(console.status_code, 200)
+        self.assertIn("Skill Temple Retrieval Console", console.text)
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(console_unauthorized.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+        self.assertEqual(console_authorized.status_code, 200)
+        self.assertIn("BearerAuth", schema["components"]["securitySchemes"])
+        self.assertEqual(
+            schema["paths"]["/v1/skills/load"]["post"]["security"],
+            [{"BearerAuth": []}],
+        )
+
+    def test_openapi_builder_uses_configured_server_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "openapi.json"
+            with patch.dict(
+                os.environ,
+                {
+                    "SKILL_TEMPLE_SERVER_URL": "https://skills.example.com",
+                    "SKILL_TEMPLE_BEARER_TOKEN": "secret-token",
+                },
+                clear=False,
+            ):
+                built = build_openapi(output_path=output)
+            schema = json.loads(built.read_text(encoding="utf-8"))
+
+        self.assertEqual(schema["servers"], [{"url": "https://skills.example.com"}])
+        self.assertIn("BearerAuth", schema["components"]["securitySchemes"])
+        self.assertIn("/v1/skills/load", schema["paths"])
+        self.assertNotIn("/console", schema["paths"])
+
+    def test_skill_eval_file_passes(self) -> None:
+        report = evaluate_file(Path("evals/skill_queries.jsonl"))
+        self.assertEqual(report["failed"], 0)
+        self.assertEqual(report["passed"], 2)
 
 
 if __name__ == "__main__":

@@ -88,6 +88,39 @@ skill-temple-build-prompt `
   --output dist/GPT_INSTRUCTIONS.md
 ```
 
+## 生成 `openapi.json`
+
+安装后运行：
+
+```powershell
+skill-temple-build-openapi
+```
+
+默认输出根目录的 `openapi.json`。生成器优先读取 `.env` 中的：
+
+```dotenv
+SKILL_TEMPLE_SERVER_URL=https://skills.example.com
+SKILL_TEMPLE_OPENAPI_OUTPUT=openapi.json
+```
+
+因此生成结果会包含：
+
+```json
+{
+  "servers": [
+    {"url": "https://skills.example.com"}
+  ]
+}
+```
+
+也可以直接覆盖：
+
+```powershell
+skill-temple-build-openapi `
+  --server-url https://skills.example.com `
+  --output openapi.json
+```
+
 ## `loadSkills`
 
 请求：
@@ -130,6 +163,8 @@ skill-temple-build-prompt `
 ```dotenv
 SKILL_TEMPLE_SERVER_URL=https://skills.example.com
 SKILL_TEMPLE_SKILLS_DIR=C:/path/to/project/skills
+SKILL_TEMPLE_BEARER_TOKEN=replace-with-a-long-random-secret
+SKILL_TEMPLE_OPENAPI_OUTPUT=openapi.json
 WORKSPACE_ROOT=C:/path/to/project/workspace
 WORKSPACE_PWSH_PATH=pwsh
 WORKSPACE_OPERATION_ROOT=C:/path/to/project/.runtime/workspace-operations
@@ -147,6 +182,14 @@ Skill 目录查找顺序：
 3. 当前目录 `.env`
 4. 当前目录的 `skills/`
 5. 包内示例 Skill
+
+设置 `SKILL_TEMPLE_BEARER_TOKEN` 后，所有 `/v1/*` 接口以及控制台的加载、读取请求都要求：
+
+```text
+Authorization: Bearer <token>
+```
+
+`/openapi.json`、`/health` 和 `/console` 保持公开，方便导入 schema 和打开调试页面。生成的 OpenAPI 会自动包含 `BearerAuth` security scheme。
 
 ## 安装和运行
 
@@ -167,11 +210,37 @@ http://127.0.0.1:8765/openapi.json
 http://127.0.0.1:8765/health
 ```
 
+调试检索控制台：
+
+```text
+http://127.0.0.1:8765/console
+```
+
+控制台可以查看 Skill 目录、调用 `loadSkills`，以及读取选中 Skill 内的引用文件。Token 只保存在当前浏览器标签页的 `sessionStorage`。
+
+## Skill 检索评测
+
+评测工具验证编译目录、精确加载、引用路径和关键符号是否可达：
+
+```powershell
+skill-temple-eval evals/skill_queries.jsonl
+```
+
+JSONL 示例：
+
+```json
+{"id":"api-review","query":"review API compatibility","expected_skill":"api-review","expected_paths":["docs/openapi.md"],"expected_symbols":["breaking change"]}
+```
+
+当前架构由模型根据静态目录选择 Skill，因此该工具不模拟服务端语义路由，只检查被选 Skill 的加载链路和引用资料是否完整。
+
 ## 验证
 
 ```powershell
 python -m ruff check .
 python -m pytest -q
+skill-temple-eval evals/skill_queries.jsonl
+skill-temple-build-openapi --output .runtime/openapi.json
 ```
 
-测试覆盖：Skill 扫描、目录生成、精确加载、Codex 风格上下文、引用路径发现、安全读取、OpenAPI 和 Workspace Actions。
+测试覆盖：Skill 扫描、目录生成、精确加载、Codex 风格上下文、引用路径发现、安全读取、Bearer Token、调试控制台、评测工具、OpenAPI 生成和 Workspace Actions。
