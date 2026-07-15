@@ -232,15 +232,15 @@ def prepare_text_patch(
                     status_code=409,
                 )
             assert_text_bytes(original, path=operation.path)
-            original_text = (
-                original.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-            )
+            decoded = original.decode("utf-8")
+            line_ending = _detect_line_ending(decoded)
+            original_text = decoded.replace("\r\n", "\n").replace("\r", "\n")
             lines, trailing = _split_text_lines(original_text)
             new_lines = _apply_hunks(lines, operation.hunks, operation.path)
-            current[operation.path] = _join_lines(
-                new_lines,
-                trailing_newline=trailing,
-            ).encode("utf-8")
+            rendered = _join_lines(new_lines, trailing_newline=trailing)
+            if line_ending != "\n":
+                rendered = rendered.replace("\n", line_ending)
+            current[operation.path] = rendered.encode("utf-8")
     return [
         PreparedFileChange(
             path=snapshot.path,
@@ -557,6 +557,18 @@ def _split_text_lines(text: str) -> tuple[list[str], bool]:
     parts = text.split("\n")
     trailing = parts[-1] == ""
     return (parts[:-1] if trailing else parts), trailing
+
+
+def _detect_line_ending(text: str) -> str:
+    crlf_count = text.count("\r\n")
+    without_crlf = text.replace("\r\n", "")
+    lf_count = without_crlf.count("\n")
+    cr_count = without_crlf.count("\r")
+    if crlf_count and crlf_count >= max(lf_count, cr_count):
+        return "\r\n"
+    if cr_count > lf_count:
+        return "\r"
+    return "\n"
 
 
 def _join_lines(lines: list[str], *, trailing_newline: bool) -> str:

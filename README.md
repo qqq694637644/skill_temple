@@ -168,7 +168,6 @@ SKILL_TEMPLE_OPENAPI_OUTPUT=openapi.json
 WORKSPACE_ROOT=C:/path/to/project/workspace
 WORKSPACE_PWSH_PATH=pwsh
 WORKSPACE_OPERATION_ROOT=C:/path/to/project/.runtime/workspace-operations
-WORKSPACE_ALLOW_NETWORK=false
 WORKSPACE_COMMAND_TIMEOUT_SECONDS=120
 WORKSPACE_COMMAND_MAX_TIMEOUT_SECONDS=3600
 WORKSPACE_COMMAND_OUTPUT_BYTES=1000000
@@ -209,6 +208,10 @@ http://127.0.0.1:8765/openapi.json
 ```text
 http://127.0.0.1:8765/health
 ```
+
+健康检查会分别报告 `skills_runtime`、`workspace_root`、`ripgrep`、`powershell` 和 `operation_root_writable`。任一 Workspace 依赖不可用时返回 HTTP 503 和 `status: error`。
+
+`workspaceCommand` 不提供网络访问开关，常见网络下载或请求命令始终被拒绝。
 
 调试检索控制台：
 

@@ -57,6 +57,17 @@ class LocalWorkspaceService:
             )
         return root
 
+    def operation_root(self) -> Path:
+        value = env_value_from_environment_or_dotenv("WORKSPACE_OPERATION_ROOT")
+        return (
+            Path(value).expanduser().resolve()
+            if value
+            else (Path.cwd() / ".runtime" / "workspace-operations").resolve()
+        )
+
+    def powershell(self) -> str:
+        return env_value_from_environment_or_dotenv("WORKSPACE_PWSH_PATH") or "pwsh"
+
     async def read_files(
         self,
         *,
@@ -313,22 +324,16 @@ class LocalWorkspaceService:
             await self._operations.shutdown()
 
     def _operation_manager(self) -> WorkspaceOperationManager:
-        runtime_value = env_value_from_environment_or_dotenv("WORKSPACE_OPERATION_ROOT")
-        runtime_root = (
-            Path(runtime_value).expanduser().resolve()
-            if runtime_value
-            else (Path.cwd() / ".runtime" / "workspace-operations").resolve()
-        )
+        runtime_root = self.operation_root()
         if self._operations is None or self._operations_root != runtime_root:
             self._operations = WorkspaceOperationManager(
                 OperationSettings(
                     root=runtime_root,
-                    shell=env_value_from_environment_or_dotenv("WORKSPACE_PWSH_PATH") or "pwsh",
+                    shell=self.powershell(),
                     default_timeout_seconds=_env_int("WORKSPACE_COMMAND_TIMEOUT_SECONDS", 120),
                     max_timeout_seconds=_env_int("WORKSPACE_COMMAND_MAX_TIMEOUT_SECONDS", 3600),
                     default_output_bytes=_env_int("WORKSPACE_COMMAND_OUTPUT_BYTES", 1_000_000),
                     max_output_bytes=_env_int("WORKSPACE_COMMAND_MAX_OUTPUT_BYTES", 10_000_000),
-                    allow_network=_env_bool("WORKSPACE_ALLOW_NETWORK", False),
                 )
             )
             self._operations_root = runtime_root
@@ -756,8 +761,3 @@ def _env_int(name: str, default: int) -> int:
         ) from exc
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    value = env_value_from_environment_or_dotenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}

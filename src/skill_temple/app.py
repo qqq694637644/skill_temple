@@ -5,14 +5,18 @@ from __future__ import annotations
 import argparse
 import copy
 import secrets
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .api_errors import StructuredErrorResponse, error_payload, error_response
 from .runtime import (
     SkillNotFoundError,
     SkillPathError,
@@ -20,6 +24,8 @@ from .runtime import (
     load_runtime,
 )
 from .workspace_actions import register_workspace_actions
+from .workspace_files import LocalWorkspaceService
+from .workspace_patch import WorkspaceToolError
 
 BEARER_TOKEN_ENV_VAR = "SKILL_TEMPLE_BEARER_TOKEN"
 
@@ -40,16 +46,6 @@ class ReadSkillContentRequest(StrictRequest):
     path: str = Field(description="Relative path inside the selected Skill.")
     start_line: int = Field(default=1, ge=1)
     max_lines: int = Field(default=2000, ge=1, le=10000)
-
-
-class ErrorDetail(BaseModel):
-    code: str
-    message: str
-    suggested_next_action: str
-
-
-class StructuredErrorResponse(BaseModel):
-    error: ErrorDetail
 
 
 class LoadedSkillPacket(BaseModel):
@@ -140,14 +136,82 @@ def _add_bearer_auth_security(schema: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def _error(code: str, message: str, next_action: str) -> dict[str, object]:
-    return {
-        "error": {
-            "code": code,
-            "message": message,
-            "suggested_next_action": next_action,
-        }
+def _health_payload(
+    runtime: Any,
+    workspace_service: LocalWorkspaceService,
+) -> tuple[dict[str, object], bool]:
+    checks: dict[str, dict[str, object]] = {}
+
+    skills_dir = runtime.skills_dir
+    try:
+        runtime.list_skills()
+        skills_ok = skills_dir.is_dir()
+        skills_message = None if skills_ok else "Skills directory is not available."
+    except Exception as exc:
+        skills_ok = False
+        skills_message = str(exc)
+    checks["skills_runtime"] = {
+        "ok": skills_ok,
+        "path": str(skills_dir),
+        "message": skills_message,
     }
+
+    try:
+        workspace_root = workspace_service.root()
+        checks["workspace_root"] = {
+            "ok": True,
+            "path": str(workspace_root),
+            "message": None,
+        }
+    except WorkspaceToolError as exc:
+        checks["workspace_root"] = {
+            "ok": False,
+            "path": None,
+            "message": exc.message,
+        }
+
+    ripgrep_path = shutil.which("rg")
+    checks["ripgrep"] = {
+        "ok": ripgrep_path is not None,
+        "path": ripgrep_path,
+        "message": None if ripgrep_path else "ripgrep (rg) was not found on PATH.",
+    }
+
+    powershell_command = workspace_service.powershell()
+    powershell_path = shutil.which(powershell_command)
+    checks["powershell"] = {
+        "ok": powershell_path is not None,
+        "command": powershell_command,
+        "path": powershell_path,
+        "message": None if powershell_path else "PowerShell 7 was not found.",
+    }
+
+    operation_root = workspace_service.operation_root()
+    operation_error: str | None = None
+    try:
+        operation_root.mkdir(parents=True, exist_ok=True)
+        if not operation_root.is_dir():
+            raise NotADirectoryError(str(operation_root))
+        with tempfile.NamedTemporaryFile(
+            prefix=".skill-temple-health-",
+            dir=operation_root,
+        ) as probe:
+            probe.write(b"ok")
+            probe.flush()
+    except OSError as exc:
+        operation_error = str(exc)
+    checks["operation_root_writable"] = {
+        "ok": operation_error is None,
+        "path": str(operation_root),
+        "message": operation_error,
+    }
+
+    healthy = all(bool(check["ok"]) for check in checks.values())
+    return {
+        "status": "ok" if healthy else "error",
+        "skills_dir": str(skills_dir),
+        **checks,
+    }, healthy
 
 
 def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
@@ -169,6 +233,19 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
     )
+    workspace_service = register_workspace_actions(app)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        _request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        return error_response(
+            422,
+            "validation_error",
+            str(exc),
+            "check_request",
+        )
 
     original_openapi = app.openapi
 
@@ -188,7 +265,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             ):
                 return JSONResponse(
                     status_code=401,
-                    content=_error(
+                    content=error_payload(
                         "unauthorized",
                         "Missing or invalid Bearer token.",
                         "configure_bearer_auth",
@@ -216,8 +293,9 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         return schema
 
     @app.get("/health", include_in_schema=False)
-    def health_check() -> dict[str, object]:
-        return {"status": "ok", "skills_dir": str(runtime.skills_dir)}
+    def health_check() -> JSONResponse:
+        payload, healthy = _health_payload(runtime, workspace_service)
+        return JSONResponse(status_code=200 if healthy else 503, content=payload)
 
     @app.get("/v1/skills", include_in_schema=False)
     def list_skills() -> dict[str, object]:
@@ -227,73 +305,62 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
     def console() -> HTMLResponse:
         return HTMLResponse(CONSOLE_HTML)
 
-    @app.post("/console/load", include_in_schema=False)
-    def console_load(request: LoadSkillsRequest) -> dict[str, Any]:
+    @app.post("/console/load", include_in_schema=False, response_model=None)
+    def console_load(request: LoadSkillsRequest) -> dict[str, Any] | JSONResponse:
         try:
             return load_selected(request)
         except SkillNotFoundError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("skill_not_found", str(exc), "check_skill_id"),
-            ) from exc
+            return error_response(404, "skill_not_found", str(exc), "check_skill_id")
 
-    @app.post("/console/read", include_in_schema=False)
-    def console_read(request: ReadSkillContentRequest) -> dict[str, Any]:
+    @app.post("/console/read", include_in_schema=False, response_model=None)
+    def console_read(request: ReadSkillContentRequest) -> dict[str, Any] | JSONResponse:
         try:
             return read_selected(request)
         except SkillNotFoundError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("skill_not_found", str(exc), "check_skill_id"),
-            ) from exc
+            return error_response(404, "skill_not_found", str(exc), "check_skill_id")
         except SkillPathError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("unsafe_or_missing_path", str(exc), "check_path"),
-            ) from exc
+            return error_response(404, "unsafe_or_missing_path", str(exc), "check_path")
 
     @app.post(
         "/v1/skills/load",
         operation_id="loadSkills",
         response_model=LoadSkillsResponse,
-        responses={404: {"model": StructuredErrorResponse}},
+        responses={
+            404: {"model": StructuredErrorResponse},
+            422: {"model": StructuredErrorResponse},
+        },
         summary="Load selected Skills.",
         description="Load complete SKILL.md files for exact ids selected from GPT Instructions.",
         openapi_extra={"x-openai-isConsequential": False},
     )
-    def load_skills(request: LoadSkillsRequest) -> LoadSkillsResponse:
+    def load_skills(request: LoadSkillsRequest) -> LoadSkillsResponse | JSONResponse:
         try:
             return LoadSkillsResponse.model_validate(load_selected(request))
         except SkillNotFoundError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("skill_not_found", str(exc), "check_skill_id"),
-            ) from exc
+            return error_response(404, "skill_not_found", str(exc), "check_skill_id")
 
     @app.post(
         "/v1/skills/read",
         operation_id="readSkillContent",
         response_model=ReadSkillContentResponse,
-        responses={404: {"model": StructuredErrorResponse}},
+        responses={
+            404: {"model": StructuredErrorResponse},
+            422: {"model": StructuredErrorResponse},
+        },
         summary="Read a file from a selected Skill.",
         description="Read an exact relative path from a selected Skill with line continuation.",
         openapi_extra={"x-openai-isConsequential": False},
     )
-    def read_skill_content(request: ReadSkillContentRequest) -> ReadSkillContentResponse:
+    def read_skill_content(
+        request: ReadSkillContentRequest,
+    ) -> ReadSkillContentResponse | JSONResponse:
         try:
             return ReadSkillContentResponse.model_validate(read_selected(request))
         except SkillNotFoundError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("skill_not_found", str(exc), "check_skill_id"),
-            ) from exc
+            return error_response(404, "skill_not_found", str(exc), "check_skill_id")
         except SkillPathError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("unsafe_or_missing_path", str(exc), "check_path"),
-            ) from exc
+            return error_response(404, "unsafe_or_missing_path", str(exc), "check_path")
 
-    register_workspace_actions(app)
     return app
 
 

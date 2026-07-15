@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .api_errors import StructuredErrorResponse, error_response
 from .workspace_files import LocalWorkspaceService
 from .workspace_patch import WorkspaceToolError
 
@@ -178,7 +180,6 @@ class WorkspaceCommandRequest(WorkspaceModel):
     script: str | None = Field(default=None, min_length=1, max_length=20000)
     timeout_seconds: int | None = Field(default=None, ge=1)
     max_output_bytes: int | None = Field(default=None, ge=1)
-    allow_network: bool = False
     plain_output: bool = False
     utf8_output: bool = True
     operation_id: str | None = Field(default=None, pattern=r"^op_[0-9a-f]{16}$")
@@ -220,20 +221,22 @@ class WorkspaceCommandResponse(WorkspaceModel):
     stderr_eof: bool = False
 
 
-def _raise_http(exc: WorkspaceToolError) -> None:
-    raise HTTPException(
-        status_code=exc.status_code,
-        detail={
-            "error": {
-                "code": exc.code,
-                "message": exc.message,
-                "suggested_next_action": "check_workspace_request",
-            }
-        },
-    ) from exc
+WORKSPACE_ERROR_RESPONSES = {
+    status_code: {"model": StructuredErrorResponse}
+    for status_code in (400, 403, 404, 409, 413, 422, 500, 503, 504)
+}
 
 
-def register_workspace_actions(app: FastAPI) -> None:
+def _workspace_error_response(exc: WorkspaceToolError) -> JSONResponse:
+    return error_response(
+        exc.status_code,
+        exc.code,
+        exc.message,
+        "check_workspace_request",
+    )
+
+
+def register_workspace_actions(app: FastAPI) -> LocalWorkspaceService:
     service = LocalWorkspaceService()
     app.state.local_workspace_service = service
 
@@ -243,6 +246,7 @@ def register_workspace_actions(app: FastAPI) -> None:
         "/v1/workspace/command",
         operation_id="workspaceCommand",
         response_model=WorkspaceCommandResponse,
+        responses=WORKSPACE_ERROR_RESPONSES,
         summary="Start or manage a PowerShell workspace command.",
         description=(
             "Start, inspect, read logs from, list, or cancel an asynchronous pwsh 7 "
@@ -250,7 +254,9 @@ def register_workspace_actions(app: FastAPI) -> None:
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
-    async def workspace_command(request: WorkspaceCommandRequest) -> WorkspaceCommandResponse:
+    async def workspace_command(
+        request: WorkspaceCommandRequest,
+    ) -> WorkspaceCommandResponse | JSONResponse:
         try:
             if request.action == "start":
                 assert request.idempotency_key is not None and request.script is not None
@@ -259,7 +265,6 @@ def register_workspace_actions(app: FastAPI) -> None:
                     script=request.script,
                     timeout_seconds=request.timeout_seconds,
                     max_output_bytes=request.max_output_bytes,
-                    allow_network=request.allow_network,
                     plain_output=request.plain_output,
                     utf8_output=request.utf8_output,
                 )
@@ -287,12 +292,13 @@ def register_workspace_actions(app: FastAPI) -> None:
             )
             return WorkspaceCommandResponse(action="logs", **logs)
         except WorkspaceToolError as exc:
-            _raise_http(exc)
+            return _workspace_error_response(exc)
 
     @app.post(
         "/v1/workspace/inspect",
         operation_id="workspaceInspect",
         response_model=WorkspaceInspectResponse,
+        responses=WORKSPACE_ERROR_RESPONSES,
         summary="Inspect workspace tree, search matches, and file snippets.",
         description=(
             "Inspect paths under WORKSPACE_ROOT, search with ripgrep, and read bounded "
@@ -300,18 +306,21 @@ def register_workspace_actions(app: FastAPI) -> None:
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
-    async def workspace_inspect(request: WorkspaceInspectRequest) -> WorkspaceInspectResponse:
+    async def workspace_inspect(
+        request: WorkspaceInspectRequest,
+    ) -> WorkspaceInspectResponse | JSONResponse:
         try:
             return WorkspaceInspectResponse.model_validate(
                 await service.inspect(**request.model_dump())
             )
         except WorkspaceToolError as exc:
-            _raise_http(exc)
+            return _workspace_error_response(exc)
 
     @app.post(
         "/v1/workspace/search",
         operation_id="workspaceSearch",
         response_model=WorkspaceSearchResponse,
+        responses=WORKSPACE_ERROR_RESPONSES,
         summary="Search workspace text with ripgrep.",
         description=(
             "Search selected paths with literal or regular-expression matching and return "
@@ -319,18 +328,21 @@ def register_workspace_actions(app: FastAPI) -> None:
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
-    async def workspace_search(request: WorkspaceSearchRequest) -> WorkspaceSearchResponse:
+    async def workspace_search(
+        request: WorkspaceSearchRequest,
+    ) -> WorkspaceSearchResponse | JSONResponse:
         try:
             return WorkspaceSearchResponse.model_validate(
                 await service.search(**request.model_dump())
             )
         except WorkspaceToolError as exc:
-            _raise_http(exc)
+            return _workspace_error_response(exc)
 
     @app.post(
         "/v1/workspace/read-files",
         operation_id="workspaceReadFiles",
         response_model=WorkspaceReadFilesResponse,
+        responses=WORKSPACE_ERROR_RESPONSES,
         summary="Read multiple UTF-8 workspace files with line numbers.",
         description=(
             "Read selected files from WORKSPACE_ROOT with line numbers, hashes, metadata, "
@@ -340,18 +352,19 @@ def register_workspace_actions(app: FastAPI) -> None:
     )
     async def workspace_read_files(
         request: WorkspaceReadFilesRequest,
-    ) -> WorkspaceReadFilesResponse:
+    ) -> WorkspaceReadFilesResponse | JSONResponse:
         try:
             return WorkspaceReadFilesResponse.model_validate(
                 await service.read_files(**request.model_dump())
             )
         except WorkspaceToolError as exc:
-            _raise_http(exc)
+            return _workspace_error_response(exc)
 
     @app.post(
         "/v1/workspace/write-file",
         operation_id="workspaceWriteFile",
         response_model=WorkspaceWriteFileResponse,
+        responses=WORKSPACE_ERROR_RESPONSES,
         summary="Write one UTF-8 text file.",
         description=(
             "Create or overwrite a text file with mode, SHA-256, line-ending, dry-run, "
@@ -361,19 +374,20 @@ def register_workspace_actions(app: FastAPI) -> None:
     )
     async def workspace_write_file(
         request: WorkspaceWriteFileRequest,
-    ) -> WorkspaceWriteFileResponse:
+    ) -> WorkspaceWriteFileResponse | JSONResponse:
         try:
             payload = request.model_dump(exclude={"encoding"})
             return WorkspaceWriteFileResponse.model_validate(
                 await service.write_file(**payload)
             )
         except WorkspaceToolError as exc:
-            _raise_http(exc)
+            return _workspace_error_response(exc)
 
     @app.post(
         "/v1/workspace/apply-patch",
         operation_id="workspaceApplyPatch",
         response_model=WorkspaceApplyPatchResponse,
+        responses=WORKSPACE_ERROR_RESPONSES,
         summary="Apply a controlled Codex text patch.",
         description=(
             "Apply Begin Patch/Add File/Update File/Delete File text patches with dry-run "
@@ -383,10 +397,12 @@ def register_workspace_actions(app: FastAPI) -> None:
     )
     async def workspace_apply_patch(
         request: WorkspaceApplyPatchRequest,
-    ) -> WorkspaceApplyPatchResponse:
+    ) -> WorkspaceApplyPatchResponse | JSONResponse:
         try:
             return WorkspaceApplyPatchResponse.model_validate(
                 await service.apply_patch(**request.model_dump())
             )
         except WorkspaceToolError as exc:
-            _raise_http(exc)
+            return _workspace_error_response(exc)
+
+    return service

@@ -225,6 +225,14 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("/v1/skills/retrieve", schema["paths"])
         self.assertNotIn("/v1/skills/search", schema["paths"])
+        for path in ("/v1/skills/load", "/v1/skills/read"):
+            error_schema = schema["paths"][path]["post"]["responses"]["404"]["content"][
+                "application/json"
+            ]["schema"]
+            self.assertEqual(
+                error_schema["$ref"],
+                "#/components/schemas/StructuredErrorResponse",
+            )
         for path_item in schema["paths"].values():
             for operation in path_item.values():
                 self.assertIs(operation.get("x-openai-isConsequential"), False)
@@ -254,9 +262,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(loaded.json()["loaded_skill_ids"], ["idapython"])
         self.assertEqual(read.status_code, 200)
         self.assertEqual(missing.status_code, 404)
-        self.assertEqual(missing.json()["detail"]["error"]["code"], "skill_not_found")
+        self.assertEqual(missing.json()["error"]["code"], "skill_not_found")
         self.assertEqual(unsafe.status_code, 404)
-        self.assertEqual(unsafe.json()["detail"]["error"]["code"], "unsafe_or_missing_path")
+        self.assertEqual(unsafe.json()["error"]["code"], "unsafe_or_missing_path")
 
     def test_optional_bearer_auth_and_debug_console(self) -> None:
         with patch.dict(

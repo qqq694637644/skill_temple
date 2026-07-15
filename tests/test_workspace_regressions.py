@@ -419,7 +419,6 @@ def test_initial_operation_state_write_failure_rolls_back_all_indexes() -> None:
                         script="Write-Output unreachable",
                         timeout_seconds=10,
                         max_output_bytes=20_000,
-                        allow_network=False,
                         plain_output=True,
                         utf8_output=True,
                     )
@@ -466,7 +465,6 @@ def test_command_startup_uses_end_to_end_deadline() -> None:
                     script="Write-Output unreachable",
                     timeout_seconds=0.05,
                     max_output_bytes=20_000,
-                    allow_network=False,
                     plain_output=True,
                     utf8_output=True,
                 )
@@ -548,6 +546,6 @@ def test_command_failed_and_idempotency_conflict() -> None:
                     },
                 )
                 assert conflict.status_code == 409
-                assert conflict.json()["detail"]["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+                assert conflict.json()["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
         finally:
             _close_client(client)

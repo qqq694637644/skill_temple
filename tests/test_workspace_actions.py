@@ -48,6 +48,67 @@ class WorkspaceActionsTests(unittest.TestCase):
             for operation in path_item.values():
                 self.assertIs(operation["x-openai-isConsequential"], False)
                 self.assertLessEqual(len(operation.get("description", "")), 300)
+        command_properties = schema["components"]["schemas"]["WorkspaceCommandRequest"][
+            "properties"
+        ]
+        self.assertNotIn("allow_network", command_properties)
+        for operation_id in (
+            "workspaceCommand",
+            "workspaceInspect",
+            "workspaceSearch",
+            "workspaceReadFiles",
+            "workspaceWriteFile",
+            "workspaceApplyPatch",
+        ):
+            operation = next(
+                operation
+                for path_item in schema["paths"].values()
+                for operation in path_item.values()
+                if isinstance(operation, dict)
+                and operation.get("operationId") == operation_id
+            )
+            for status_code in ("409", "503"):
+                response_schema = operation["responses"][status_code]["content"][
+                    "application/json"
+                ]["schema"]
+                self.assertEqual(
+                    response_schema["$ref"],
+                    "#/components/schemas/StructuredErrorResponse",
+                )
+
+    def test_health_reports_workspace_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as operations:
+            root = Path(temp)
+            environment = {
+                "WORKSPACE_ROOT": str(root),
+                "WORKSPACE_OPERATION_ROOT": operations,
+            }
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch(
+                    "skill_temple.app.shutil.which",
+                    side_effect=lambda command: f"/tools/{command}",
+                ),
+            ):
+                response = TestClient(create_app()).get("/health")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        for name in (
+            "skills_runtime",
+            "workspace_root",
+            "ripgrep",
+            "powershell",
+            "operation_root_writable",
+        ):
+            self.assertTrue(body[name]["ok"], name)
+
+    def test_health_returns_503_when_workspace_is_unavailable(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            response = TestClient(create_app()).get("/health")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertFalse(response.json()["workspace_root"]["ok"])
 
     def test_missing_workspace_root_is_structured(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -55,7 +116,7 @@ class WorkspaceActionsTests(unittest.TestCase):
             response = client.post("/v1/workspace/read-files", json={"paths": ["a.txt"]})
         self.assertEqual(response.status_code, 503)
         self.assertEqual(
-            response.json()["detail"]["error"]["code"],
+            response.json()["error"]["code"],
             "WORKSPACE_ROOT_NOT_CONFIGURED",
         )
 
@@ -222,6 +283,59 @@ class WorkspaceActionsTests(unittest.TestCase):
             )
             self.assertEqual(deleted.status_code, 200, deleted.text)
             self.assertFalse((root / "beta.txt").exists())
+
+    def test_apply_patch_preserves_crlf_line_endings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "alpha.txt"
+            target.write_bytes(b"one\r\ntwo\r\n")
+            client = self._client(root)
+            response = client.post(
+                "/v1/workspace/apply-patch",
+                json={
+                    "patch": (
+                        "*** Begin Patch\n"
+                        "*** Update File: alpha.txt\n"
+                        "@@\n"
+                        "-one\n"
+                        "+ONE\n"
+                        " two\n"
+                        "*** End Patch\n"
+                    )
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(target.read_bytes(), b"ONE\r\ntwo\r\n")
+
+    def test_workspace_command_network_access_cannot_be_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = self._client(root)
+            rejected_option = client.post(
+                "/v1/workspace/command",
+                json={
+                    "action": "start",
+                    "idempotency_key": "network-option-rejected",
+                    "script": "Write-Output ok",
+                    "allow_network": True,
+                },
+            )
+            self.assertEqual(rejected_option.status_code, 422)
+            self.assertEqual(rejected_option.json()["error"]["code"], "validation_error")
+
+            rejected_script = client.post(
+                "/v1/workspace/command",
+                json={
+                    "action": "start",
+                    "idempotency_key": "network-script-rejected",
+                    "script": "Invoke-WebRequest https://example.com",
+                },
+            )
+            self.assertEqual(rejected_script.status_code, 403)
+            self.assertEqual(
+                rejected_script.json()["error"]["code"],
+                "WORKSPACE_SCRIPT_REJECTED",
+            )
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is required")
     def test_command_start_get_logs_list_timeout_and_cancel(self) -> None:

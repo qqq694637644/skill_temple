@@ -79,7 +79,6 @@ class OperationSettings:
     max_timeout_seconds: int = 3600
     default_output_bytes: int = 1_000_000
     max_output_bytes: int = 10_000_000
-    allow_network: bool = False
     kill_grace_seconds: int = 5
     reader_grace_seconds: int = 2
     shutdown_seconds: int = 10
@@ -262,7 +261,6 @@ class WorkspaceOperationManager:
         script: str,
         timeout_seconds: int | None,
         max_output_bytes: int | None,
-        allow_network: bool,
         plain_output: bool,
         utf8_output: bool,
     ) -> dict[str, Any]:
@@ -280,17 +278,12 @@ class WorkspaceOperationManager:
                 f"max_output_bytes exceeds {self.settings.max_output_bytes}.",
                 status_code=422,
             )
-        _validate_script(
-            script,
-            allow_network=allow_network,
-            server_allow_network=self.settings.allow_network,
-        )
+        _validate_script(script)
         request_payload = {
             "root": str(workspace_root),
             "script": script,
             "timeout_seconds": timeout,
             "max_output_bytes": output_limit,
-            "allow_network": allow_network,
             "plain_output": plain_output,
             "utf8_output": utf8_output,
         }
@@ -879,20 +872,13 @@ def _build_pwsh_script(script: str, *, plain_output: bool, utf8_output: bool) ->
     return "\n".join([*prelude, script]) if prelude else script
 
 
-def _validate_script(script: str, *, allow_network: bool, server_allow_network: bool) -> None:
+def _validate_script(script: str) -> None:
     for pattern, message in _BLOCKED_ALWAYS:
         if pattern.search(script):
             raise WorkspaceToolError("WORKSPACE_SCRIPT_REJECTED", message, status_code=403)
-    if allow_network and not server_allow_network:
-        raise WorkspaceToolError(
-            "WORKSPACE_SCRIPT_REJECTED",
-            "Network access is disabled by server configuration.",
-            status_code=403,
-        )
-    if not allow_network:
-        for pattern, message in _NETWORK_BLOCKED:
-            if pattern.search(script):
-                raise WorkspaceToolError("WORKSPACE_SCRIPT_REJECTED", message, status_code=403)
+    for pattern, message in _NETWORK_BLOCKED:
+        if pattern.search(script):
+            raise WorkspaceToolError("WORKSPACE_SCRIPT_REJECTED", message, status_code=403)
 
 
 def _sanitized_environment() -> dict[str, str]:
