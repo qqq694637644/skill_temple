@@ -21,7 +21,7 @@ not include IDA Actions or any project-specific backend operations.
 - Multiple explicit Skills are loaded together up to a maximum of three.
 - The discovery catalog has a separate 20,000-character budget.
 - Optional Bearer authentication is supported for `/v1/*` routes.
-- Only three operations are exposed to GPT Actions.
+- Nine operations are exposed: three Skill actions and six generic Workspace actions.
 
 ## Public GPT Actions
 
@@ -30,14 +30,44 @@ not include IDA Actions or any project-specific backend operations.
 | `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Return a bounded Skill catalog or load explicitly selected `SKILL.md` files. |
 | `readSkillContent` | `POST` | `/v1/skills/read` | Read an exact safe relative path with continuation metadata. |
 | `searchSkillDocs` | `POST` | `/v1/skills/search` | Search indexed resources inside one selected Skill. |
+| `workspaceCommand` | `POST` | `/v1/workspace/command` | Start or manage an asynchronous PowerShell command under `WORKSPACE_ROOT`. |
+| `workspaceInspect` | `POST` | `/v1/workspace/inspect` | Inspect the workspace tree, search matches, and bounded file snippets. |
+| `workspaceSearch` | `POST` | `/v1/workspace/search` | Search selected workspace paths with ripgrep. |
+| `workspaceReadFiles` | `POST` | `/v1/workspace/read-files` | Read multiple UTF-8 files with line numbers and continuation metadata. |
+| `workspaceWriteFile` | `POST` | `/v1/workspace/write-file` | Create or replace one UTF-8 text file with hash and dry-run controls. |
+| `workspaceApplyPatch` | `POST` | `/v1/workspace/apply-patch` | Apply a controlled multi-file text patch with rollback on failure. |
 
-All three operations publish:
+All public operations publish:
 
 ```json
 {"x-openai-isConsequential": false}
 ```
 
-Projects can add their own domain Actions beside these three operations.
+Projects can add their own domain Actions beside these built-in operations.
+
+## Workspace Actions
+
+Workspace Actions provide reusable local repository and project-file operations without
+depending on any domain application. All relative paths are resolved from
+`WORKSPACE_ROOT`.
+
+- `workspaceInspect` combines a bounded directory tree, optional ripgrep searches, and
+  related UTF-8 file snippets.
+- `workspaceSearch` supports literal or regular-expression matching, case controls,
+  context lines, and response-size limits.
+- `workspaceReadFiles` returns numbered lines, SHA-256 metadata, truncation state, and
+  `next_start_line` continuation.
+- `workspaceWriteFile` supports create-only, unconditional overwrite, and hash-checked
+  overwrite modes, plus line-ending selection and dry-run.
+- `workspaceApplyPatch` supports Add, Update, and optionally Delete operations. Changes
+  are staged and rolled back when a commit step fails.
+- `workspaceCommand` runs PowerShell 7 asynchronously. Use `start`, then poll `get` or
+  read incremental `logs` until a terminal state is reached; `cancel` terminates the
+  process tree.
+
+Text mutations use `.skill-temple-workspace-transactions` beside the workspace while a
+transaction is active. Successful transactions clean this directory automatically.
+Workspace search requires `rg`; command execution requires `pwsh`.
 
 ## Skill directory contract
 
@@ -299,6 +329,14 @@ Copy `.env.example` to `.env`:
 SKILL_TEMPLE_SERVER_URL=https://skills.example.com
 SKILL_TEMPLE_SKILLS_DIR=C:/path/to/project/skills
 SKILL_TEMPLE_BEARER_TOKEN=replace-with-a-long-random-secret
+WORKSPACE_ROOT=C:/path/to/project/workspace
+WORKSPACE_PWSH_PATH=pwsh
+WORKSPACE_OPERATION_ROOT=C:/path/to/project/.runtime/workspace-operations
+WORKSPACE_ALLOW_NETWORK=false
+WORKSPACE_COMMAND_TIMEOUT_SECONDS=120
+WORKSPACE_COMMAND_MAX_TIMEOUT_SECONDS=3600
+WORKSPACE_COMMAND_OUTPUT_BYTES=1000000
+WORKSPACE_COMMAND_MAX_OUTPUT_BYTES=10000000
 ```
 
 `SKILL_TEMPLE_SKILLS_DIR` lookup order:
@@ -317,6 +355,11 @@ Authorization: Bearer <token>
 
 `/openapi.json`, `/health`, and `/console` remain public so the schema can be imported
 and the debug console can load.
+
+`WORKSPACE_ALLOW_NETWORK=false` rejects known download and request commands even when a
+caller asks for network access. Workspace commands also reject GitHub CLI authentication,
+secret operations, environment enumeration, SSH, and SCP. The subprocess receives a
+sanitized environment instead of the gateway process environment.
 
 ## Install and run
 
@@ -393,7 +436,10 @@ The test suite covers:
 - continuation and path safety;
 - OpenAPI operation/schema stability;
 - optional Bearer authentication;
-- deterministic search/eval behavior.
+- deterministic search/eval behavior;
+- Workspace OpenAPI contracts, UTF-8 reads, search/inspect behavior, and response bounds;
+- file write modes, hash checks, dry-run behavior, patch rollback, and cleanup failures;
+- asynchronous command success, failure, timeout, cancellation, recovery, and idempotency.
 
 ## Packaged example
 

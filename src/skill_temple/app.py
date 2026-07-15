@@ -29,6 +29,7 @@ from .runtime import (
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
+from .workspace_actions import register_workspace_actions
 
 BEARER_TOKEN_ENV_VAR = "SKILL_TEMPLE_BEARER_TOKEN"
 
@@ -439,6 +440,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
             raise HTTPException(status_code=404, detail=detail) from exc
 
+    register_workspace_actions(app)
     return app
 
 

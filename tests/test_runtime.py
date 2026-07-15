@@ -339,7 +339,7 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(SkillRuntimeError, "description exceeds"):
                 SkillRuntime(root)
 
-    def test_openapi_exposes_only_three_skill_actions(self) -> None:
+    def test_openapi_exposes_skill_and_workspace_actions(self) -> None:
         schema = create_app().openapi()
         operation_ids = {
             operation["operationId"]
@@ -348,7 +348,17 @@ class RuntimeTests(unittest.TestCase):
         }
         self.assertEqual(
             operation_ids,
-            {"retrieveSkillContext", "searchSkillDocs", "readSkillContent"},
+            {
+                "retrieveSkillContext",
+                "searchSkillDocs",
+                "readSkillContent",
+                "workspaceCommand",
+                "workspaceInspect",
+                "workspaceSearch",
+                "workspaceReadFiles",
+                "workspaceWriteFile",
+                "workspaceApplyPatch",
+            },
         )
         for path_item in schema["paths"].values():
             for operation in path_item.values():
