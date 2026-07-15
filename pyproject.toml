@@ -1,7 +1,7 @@
 [project]
 name = "skill-temple"
-version = "0.2.0"
-description = "Codex-style model-driven Skills adapted to Custom GPT Actions"
+version = "0.3.0"
+description = "Codex-style compiled Skill catalogs for Custom GPT Actions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -24,7 +24,7 @@ dev = [
 
 [project.scripts]
 skill-temple = "skill_temple.app:main"
-skill-temple-eval = "skill_temple.evals:main"
+skill-temple-build-prompt = "skill_temple.prompt_builder:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
