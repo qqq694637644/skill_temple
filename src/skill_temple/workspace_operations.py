@@ -218,7 +218,7 @@ class WorkspaceOperationManager:
         self._registry_lock = asyncio.Lock()
         self._records: dict[str, dict[str, Any]] = {}
         self._runtimes: dict[str, OperationRuntime] = {}
-        self._idempotency: dict[str, str] = {}
+        self._idempotency: dict[tuple[str, str], str] = {}
         self._background_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._load_records()
         self.recover_running_operations()
@@ -236,8 +236,9 @@ class WorkspaceOperationManager:
             operation_id = str(record.get("operation_id") or directory.name)
             self._records[operation_id] = record
             key = record.get("idempotency_key")
-            if isinstance(key, str):
-                self._idempotency[key] = operation_id
+            request_hash = record.get("request_hash")
+            if isinstance(key, str) and isinstance(request_hash, str):
+                self._idempotency[(key, request_hash)] = operation_id
 
     def recover_running_operations(self) -> int:
         recovered = 0
@@ -297,17 +298,11 @@ class WorkspaceOperationManager:
         request_hash = hashlib.sha256(
             json.dumps(request_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
+        idempotency_index = (idempotency_key, request_hash)
         async with self._registry_lock:
-            existing_id = self._idempotency.get(idempotency_key)
+            existing_id = self._idempotency.get(idempotency_index)
             if existing_id:
-                existing = self._records[existing_id]
-                if existing.get("request_hash") != request_hash:
-                    raise WorkspaceToolError(
-                        "IDEMPOTENCY_KEY_REUSED",
-                        "The same idempotency_key was reused with a different command request.",
-                        status_code=409,
-                    )
-                return self._public_record(existing)
+                return self._public_record(self._records[existing_id])
 
             operation_id = "op_" + secrets.token_hex(8)
             started_monotonic = time.monotonic()
@@ -343,13 +338,13 @@ class WorkspaceOperationManager:
             )
             self._records[operation_id] = record
             self._runtimes[operation_id] = runtime
-            self._idempotency[idempotency_key] = operation_id
+            self._idempotency[idempotency_index] = operation_id
             try:
                 self._write_record(record)
             except OSError:
                 self._records.pop(operation_id, None)
                 self._runtimes.pop(operation_id, None)
-                self._idempotency.pop(idempotency_key, None)
+                self._idempotency.pop(idempotency_index, None)
                 raise
             runtime.task = asyncio.create_task(
                 self._run(
@@ -444,8 +439,9 @@ class WorkspaceOperationManager:
                 continue
             self._records.pop(operation_id, None)
             key = record.get("idempotency_key")
-            if isinstance(key, str):
-                self._idempotency.pop(key, None)
+            request_hash = record.get("request_hash")
+            if isinstance(key, str) and isinstance(request_hash, str):
+                self._idempotency.pop((key, request_hash), None)
             removed += 1
         return removed
 
