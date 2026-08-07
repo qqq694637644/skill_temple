@@ -506,7 +506,7 @@ def test_running_operation_is_recovered_as_interrupted() -> None:
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 is not available")
-def test_command_failed_and_idempotency_conflict() -> None:
+def test_command_failed_and_same_idempotency_key_allows_different_request() -> None:
     with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as operations:
         root = Path(temp)
         client = _client(root, Path(operations))
@@ -538,7 +538,7 @@ def test_command_failed_and_idempotency_conflict() -> None:
                 assert terminal["state"] == "failed"
                 assert terminal["exit_code"] == 7
 
-                conflict = client.post(
+                different = client.post(
                     "/v1/workspace/command",
                     json={
                         "action": "start",
@@ -547,7 +547,7 @@ def test_command_failed_and_idempotency_conflict() -> None:
                         "timeout_seconds": 10,
                     },
                 )
-                assert conflict.status_code == 409
-                assert conflict.json()["detail"]["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+                assert different.status_code == 200, different.text
+                assert different.json()["operation"]["operation_id"] != operation_id
         finally:
             _close_client(client)
